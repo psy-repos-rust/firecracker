@@ -5,117 +5,25 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-use std::path::PathBuf;
-use std::{fmt, fs, mem, result, u32};
+use std::mem::offset_of;
 
 use kvm_bindings::*;
-use kvm_ioctls::VcpuFd;
-use utils::vm_memory::GuestMemoryMmap;
-use versionize::*;
-use versionize_derive::Versionize;
-
-use super::get_fdt_addr;
-
-/// Struct describing a saved aarch64 register.
-///
-/// Used for interacting with `KVM_GET/SET_ONE_REG`.
-#[derive(Debug, Clone, Versionize, PartialEq, Eq)]
-pub struct Aarch64Register {
-    /// The KVM register ID.
-    ///
-    /// See https://docs.kernel.org/virt/kvm/api.html?highlight=kvm_set_one_reg#kvm-set-one-reg
-    pub id: u64,
-
-    /// The value of the register.
-    ///
-    /// 128 bit wide, as we want to restore the V0-V31 FP SIMD registers,
-    /// which are this wide.
-    pub value: u128,
-}
-
-/// Errors thrown while setting aarch64 registers.
-#[derive(Debug)]
-pub enum Error {
-    /// Failed to get core register (PC, PSTATE or general purpose ones).
-    GetCoreRegister(kvm_ioctls::Error, String),
-    /// Failed to get multiprocessor state.
-    GetMP(kvm_ioctls::Error),
-    /// Failed to get the register list.
-    GetRegList(kvm_ioctls::Error),
-    /// Failed to get a system register.
-    GetSysRegister(kvm_ioctls::Error),
-    /// A FamStructWrapper operation has failed.
-    Fam(utils::fam::Error),
-    /// Failed to set core register (PC, PSTATE or general purpose ones).
-    SetCoreRegister(kvm_ioctls::Error, String),
-    /// Failed to Set multiprocessor state.
-    SetMP(kvm_ioctls::Error),
-    /// Failed to get a system register.
-    SetRegister(kvm_ioctls::Error),
-    /// Failed to get midr_el1 from host.
-    GetMidrEl1(String),
-}
-type Result<T> = result::Result<T, Error>;
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::Error::*;
-
-        match *self {
-            GetCoreRegister(ref err, ref desc) => {
-                write!(f, "Failed to get {} register: {}", desc, err)
-            }
-            GetMP(ref err) => write!(f, "Failed to get multiprocessor state: {}", err),
-            GetRegList(ref err) => write!(f, "Failed to retrieve list of registers: {}", err),
-            GetSysRegister(ref err) => write!(f, "Failed to get system register: {}", err),
-            SetCoreRegister(ref err, ref desc) => {
-                write!(f, "Failed to set {} register: {}", desc, err)
-            }
-            SetMP(ref err) => write!(f, "Failed to set multiprocessor state: {}", err),
-            SetRegister(ref err) => write!(f, "Failed to set register: {}", err),
-            GetMidrEl1(ref err) => write!(f, "{}", err),
-            Fam(ref err) => write!(f, "Failed FamStructWrapper operation: {:?}", err),
-        }
-    }
-}
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[allow(non_upper_case_globals)]
-// PSR (Processor State Register) bits.
-// Taken from arch/arm64/include/uapi/asm/ptrace.h.
+/// PSR (Processor State Register) bits.
+/// Taken from arch/arm64/include/uapi/asm/ptrace.h.
 const PSR_MODE_EL1h: u64 = 0x0000_0005;
 const PSR_F_BIT: u64 = 0x0000_0040;
 const PSR_I_BIT: u64 = 0x0000_0080;
 const PSR_A_BIT: u64 = 0x0000_0100;
 const PSR_D_BIT: u64 = 0x0000_0200;
-// Taken from arch/arm64/kvm/inject_fault.c.
-const PSTATE_FAULT_BITS_64: u64 = PSR_MODE_EL1h | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
-
-// Number of general purpose registers (i.e X0..X31)
-const NR_GP_REGS: usize = 31;
-// Number of FP_VREG registers.
-const NR_FP_VREGS: usize = 32;
-
-// Following are macros that help with getting the ID of a aarch64 core register.
-// The core register are represented by the user_pt_regs structure. Look for it in
-// arch/arm64/include/uapi/asm/ptrace.h.
-
-// Gets offset of a member (`field`) within a struct (`container`).
-// Same as bindgen offset tests.
-macro_rules! offset__of {
-    ($container:ty, $field:ident) => {
-        // SAFETY: The implementation closely matches that of the memoffset crate,
-        // which have been under extensive review.
-        unsafe {
-            let uninit = std::mem::MaybeUninit::<$container>::uninit();
-            let ptr = uninit.as_ptr();
-            std::ptr::addr_of!((*ptr).$field) as usize - ptr as usize
-        }
-    };
-}
+/// Taken from arch/arm64/kvm/inject_fault.c.
+pub const PSTATE_FAULT_BITS_64: u64 = PSR_MODE_EL1h | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
 
 /// Gets a core id.
 macro_rules! arm64_core_reg_id {
-    ($size: tt, $offset: tt) => {
+    ($size: ident, $offset: expr) => {
         // The core registers of an arm64 machine are represented
         // in kernel by the `kvm_regs` structure. This structure is a
         // mix of 32, 64 and 128 bit fields:
@@ -140,15 +48,16 @@ macro_rules! arm64_core_reg_id {
         // id = KVM_REG_ARM64 | KVM_REG_SIZE_U64/KVM_REG_SIZE_U32/KVM_REG_SIZE_U128 |
         // KVM_REG_ARM_CORE | offset
         KVM_REG_ARM64 as u64
-            | u64::from(KVM_REG_ARM_CORE)
+            | KVM_REG_ARM_CORE as u64
             | $size
-            | (($offset / mem::size_of::<u32>()) as u64)
+            | ($offset / std::mem::size_of::<u32>()) as u64
     };
 }
+pub(crate) use arm64_core_reg_id;
 
-// This macro computes the ID of a specific ARM64 system register similar to how
-// the kernel C macro does.
-// https://elixir.bootlin.com/linux/v4.20.17/source/arch/arm64/include/uapi/asm/kvm.h#L203
+/// This macro computes the ID of a specific ARM64 system register similar to how
+/// the kernel C macro does.
+/// https://elixir.bootlin.com/linux/v4.20.17/source/arch/arm64/include/uapi/asm/kvm.h#L203
 macro_rules! arm64_sys_reg {
     ($name: tt, $op0: tt, $op1: tt, $crn: tt, $crm: tt, $op2: tt) => {
         /// System register constant
@@ -168,445 +77,658 @@ macro_rules! arm64_sys_reg {
     };
 }
 
-// Constant imported from the Linux kernel:
+// Constants imported from the Linux kernel:
 // https://elixir.bootlin.com/linux/v4.20.17/source/arch/arm64/include/asm/sysreg.h#L135
 arm64_sys_reg!(MPIDR_EL1, 3, 0, 0, 0, 5);
 arm64_sys_reg!(MIDR_EL1, 3, 0, 0, 0, 0);
 
-/// Extract the Manufacturer ID from a VCPU state's registers.
-/// The ID is found between bits 24-31 of MIDR_EL1 register.
+// ID registers that represent cpu capabilities.
+// Needed for static cpu templates.
+arm64_sys_reg!(ID_AA64PFR0_EL1, 3, 0, 0, 4, 0);
+arm64_sys_reg!(ID_AA64ISAR0_EL1, 3, 0, 0, 6, 0);
+arm64_sys_reg!(ID_AA64ISAR1_EL1, 3, 0, 0, 6, 1);
+arm64_sys_reg!(ID_AA64MMFR2_EL1, 3, 0, 0, 7, 2);
+
+// Counter-timer Virtual Timer CompareValue register.
+// https://developer.arm.com/documentation/ddi0595/2021-12/AArch64-Registers/CNTV-CVAL-EL0--Counter-timer-Virtual-Timer-CompareValue-register
+// https://elixir.bootlin.com/linux/v6.8/source/arch/arm64/include/asm/sysreg.h#L468
+arm64_sys_reg!(SYS_CNTV_CVAL_EL0, 3, 3, 14, 3, 2);
+
+// Counter-timer Physical Count Register
+// https://developer.arm.com/documentation/ddi0601/2023-12/AArch64-Registers/CNTPCT-EL0--Counter-timer-Physical-Count-Register
+// https://elixir.bootlin.com/linux/v6.8/source/arch/arm64/include/asm/sysreg.h#L459
+arm64_sys_reg!(SYS_CNTPCT_EL0, 3, 3, 14, 0, 1);
+
+// Translation Table Base Register
+// https://developer.arm.com/documentation/ddi0595/2021-03/AArch64-Registers/TTBR1-EL1--Translation-Table-Base-Register-1--EL1-
+arm64_sys_reg!(TTBR1_EL1, 3, 0, 2, 0, 1);
+// Translation Control Register
+// https://developer.arm.com/documentation/ddi0601/2024-09/AArch64-Registers/TCR-EL1--Translation-Control-Register--EL1-
+arm64_sys_reg!(TCR_EL1, 3, 0, 2, 0, 2);
+// AArch64 Memory Model Feature Register
+// https://developer.arm.com/documentation/100798/0400/register-descriptions/aarch64-system-registers/id-aa64mmfr0-el1--aarch64-memory-model-feature-register-0--el1
+arm64_sys_reg!(ID_AA64MMFR0_EL1, 3, 0, 0, 7, 0);
+
+/// Vector lengths pseudo-register
+/// TODO: this can be removed after https://github.com/rust-vmm/kvm-bindings/pull/89
+/// is merged and new version is used in Firecracker.
+pub const KVM_REG_ARM64_SVE_VLS: u64 =
+    KVM_REG_ARM64 | KVM_REG_ARM64_SVE as u64 | KVM_REG_SIZE_U512 | 0xffff;
+
+/// Program Counter
+/// The offset value (0x100 = 32 * 8) is calcuated as follows:
+/// - `kvm_regs` includes `regs` field of type `user_pt_regs` at the beginning (i.e., at offset 0).
+/// - `pc` follows `regs[31]` and `sp` within `user_pt_regs` and they are 8 bytes each (i.e. the
+///   offset is (31 + 1) * 8 = 256).
 ///
-/// # Arguments
-///
-/// * `state` - Array slice of [`Aarch64Register`] structures, representing the registers of a VCPU
-///   state.
-pub fn get_manufacturer_id_from_state(state: &[Aarch64Register]) -> Result<u32> {
-    let midr_el1 = state.iter().find(|reg| reg.id == MIDR_EL1);
-    match midr_el1 {
-        Some(register) => Ok(register.value as u32 >> 24),
-        None => Err(Error::GetMidrEl1(
-            "Failed to find MIDR_EL1 in vCPU state!".to_string(),
-        )),
+/// https://github.com/torvalds/linux/blob/master/Documentation/virt/kvm/api.rst#L2578
+/// > 0x6030 0000 0010 0040 PC          64  regs.pc
+pub const PC: u64 = {
+    let kreg_off = offset_of!(kvm_regs, regs);
+    let pc_off = offset_of!(user_pt_regs, pc);
+    arm64_core_reg_id!(KVM_REG_SIZE_U64, kreg_off + pc_off)
+};
+
+/// Different aarch64 registers sizes
+#[derive(Debug)]
+pub enum RegSize {
+    /// 8 bit register
+    U8,
+    /// 16 bit register
+    U16,
+    /// 32 bit register
+    U32,
+    /// 64 bit register
+    U64,
+    /// 128 bit register
+    U128,
+    /// 256 bit register
+    U256,
+    /// 512 bit register
+    U512,
+    /// 1024 bit register
+    U1024,
+    /// 2048 bit register
+    U2048,
+}
+
+impl RegSize {
+    /// Size of u8 register in bytes
+    pub const U8_SIZE: usize = 1;
+    /// Size of u16 register in bytes
+    pub const U16_SIZE: usize = 2;
+    /// Size of u32 register in bytes
+    pub const U32_SIZE: usize = 4;
+    /// Size of u64 register in bytes
+    pub const U64_SIZE: usize = 8;
+    /// Size of u128 register in bytes
+    pub const U128_SIZE: usize = 16;
+    /// Size of u256 register in bytes
+    pub const U256_SIZE: usize = 32;
+    /// Size of u512 register in bytes
+    pub const U512_SIZE: usize = 64;
+    /// Size of u1024 register in bytes
+    pub const U1024_SIZE: usize = 128;
+    /// Size of u2048 register in bytes
+    pub const U2048_SIZE: usize = 256;
+}
+
+impl From<usize> for RegSize {
+    fn from(value: usize) -> Self {
+        match value {
+            RegSize::U8_SIZE => RegSize::U8,
+            RegSize::U16_SIZE => RegSize::U16,
+            RegSize::U32_SIZE => RegSize::U32,
+            RegSize::U64_SIZE => RegSize::U64,
+            RegSize::U128_SIZE => RegSize::U128,
+            RegSize::U256_SIZE => RegSize::U256,
+            RegSize::U512_SIZE => RegSize::U512,
+            RegSize::U1024_SIZE => RegSize::U1024,
+            RegSize::U2048_SIZE => RegSize::U2048,
+            _ => unreachable!("Registers bigger then 2048 bits are not supported"),
+        }
     }
 }
 
-/// Extract the Manufacturer ID from the host.
-/// The ID is found between bits 24-31 of MIDR_EL1 register.
-pub fn get_manufacturer_id_from_host() -> Result<u32> {
-    let midr_el1_path =
-        &PathBuf::from("/sys/devices/system/cpu/cpu0/regs/identification/midr_el1".to_string());
-
-    let midr_el1 = fs::read_to_string(midr_el1_path).map_err(|err| {
-        Error::GetMidrEl1(format!("Failed to get MIDR_EL1 from host path: {err}"))
-    })?;
-    let midr_el1_trimmed = midr_el1.trim_end().trim_start_matches("0x");
-    let manufacturer_id = u32::from_str_radix(midr_el1_trimmed, 16)
-        .map_err(|err| Error::GetMidrEl1(format!("Invalid MIDR_EL1 found on host: {err}",)))?;
-
-    Ok(manufacturer_id >> 24)
-}
-
-/// Configure relevant boot registers for a given vCPU.
-///
-/// # Arguments
-///
-/// * `vcpu` - Structure for the VCPU that holds the VCPU's fd.
-/// * `cpu_id` - Index of current vcpu.
-/// * `boot_ip` - Starting instruction pointer.
-/// * `mem` - Reserved DRAM for current VM.
-pub fn setup_boot_regs(
-    vcpu: &VcpuFd,
-    cpu_id: u8,
-    boot_ip: u64,
-    mem: &GuestMemoryMmap,
-) -> Result<()> {
-    let kreg_off = offset__of!(kvm_regs, regs);
-
-    // Get the register index of the PSTATE (Processor State) register.
-    let pstate = offset__of!(user_pt_regs, pstate) + kreg_off;
-    vcpu.set_one_reg(
-        arm64_core_reg_id!(KVM_REG_SIZE_U64, pstate),
-        PSTATE_FAULT_BITS_64.into(),
-    )
-    .map_err(|err| Error::SetCoreRegister(err, "processor state".to_string()))?;
-
-    // Other vCPUs are powered off initially awaiting PSCI wakeup.
-    if cpu_id == 0 {
-        // Setting the PC (Processor Counter) to the current program address (kernel address).
-        let pc = offset__of!(user_pt_regs, pc) + kreg_off;
-        vcpu.set_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, pc), boot_ip.into())
-            .map_err(|err| Error::SetCoreRegister(err, "program counter".to_string()))?;
-
-        // Last mandatory thing to set -> the address pointing to the FDT (also called DTB).
-        // "The device tree blob (dtb) must be placed on an 8-byte boundary and must
-        // not exceed 2 megabytes in size." -> https://www.kernel.org/doc/Documentation/arm64/booting.txt.
-        // We are choosing to place it the end of DRAM. See `get_fdt_addr`.
-        let regs0 = offset__of!(user_pt_regs, regs) + kreg_off;
-        vcpu.set_one_reg(
-            arm64_core_reg_id!(KVM_REG_SIZE_U64, regs0),
-            get_fdt_addr(mem).into(),
-        )
-        .map_err(|err| Error::SetCoreRegister(err, "X0".to_string()))?;
-    }
-    Ok(())
-}
-
-/// Specifies whether a particular register is a system register or not.
-/// The kernel splits the registers on aarch64 in core registers and system registers.
-/// So, below we get the system registers by checking that they are not core registers.
-///
-/// # Arguments
-///
-/// * `regid` - The index of the register we are checking.
-pub fn is_system_register(regid: u64) -> bool {
-    if (regid & u64::from(KVM_REG_ARM_COPROC_MASK)) == u64::from(KVM_REG_ARM_CORE) {
-        return false;
-    }
-
-    let size = regid & KVM_REG_SIZE_MASK;
-    if size != KVM_REG_SIZE_U32 && size != KVM_REG_SIZE_U64 {
-        panic!("Unexpected register size for system register {}", size);
-    }
-    true
-}
-
-/// Read the MPIDR - Multiprocessor Affinity Register.
-///
-/// # Arguments
-///
-/// * `vcpu` - Structure for the VCPU that holds the VCPU's fd.
-pub fn read_mpidr(vcpu: &VcpuFd) -> Result<u64> {
-    match vcpu.get_one_reg(MPIDR_EL1) {
-        Err(err) => Err(Error::GetSysRegister(err)),
-        // MPIDR register is 64 bit wide on aarch64, this expect cannot fail
-        // on supported architectures
-        Ok(val) => Ok(val.try_into().expect("MPIDR register to be 64 bit")),
+impl From<RegSize> for usize {
+    fn from(value: RegSize) -> Self {
+        match value {
+            RegSize::U8 => RegSize::U8_SIZE,
+            RegSize::U16 => RegSize::U16_SIZE,
+            RegSize::U32 => RegSize::U32_SIZE,
+            RegSize::U64 => RegSize::U64_SIZE,
+            RegSize::U128 => RegSize::U128_SIZE,
+            RegSize::U256 => RegSize::U256_SIZE,
+            RegSize::U512 => RegSize::U512_SIZE,
+            RegSize::U1024 => RegSize::U1024_SIZE,
+            RegSize::U2048 => RegSize::U2048_SIZE,
+        }
     }
 }
 
-/// Get the state of the core registers.
-///
-/// # Arguments
-///
-/// * `vcpu` - Structure for the VCPU that holds the VCPU's fd.
-/// * `state` - Structure for returning the state of the core registers.
-pub fn save_core_registers(vcpu: &VcpuFd, state: &mut Vec<Aarch64Register>) -> Result<()> {
-    let mut off = offset__of!(user_pt_regs, regs);
-    // There are 31 user_pt_regs:
-    // https://elixir.free-electrons.com/linux/v4.14.174/source/arch/arm64/include/uapi/asm/ptrace.h#L72
-    // These actually are the general-purpose registers of the Armv8-a
-    // architecture (i.e x0-x30 if used as a 64bit register or w0-w30 when used as a 32bit
-    // register).
-    for i in 0..NR_GP_REGS {
-        let id = arm64_core_reg_id!(KVM_REG_SIZE_U64, off);
-        state.push(Aarch64Register {
-            id,
-            value: vcpu
-                .get_one_reg(id)
-                .map_err(|err| Error::GetCoreRegister(err, format!("X{}", i)))?,
-        });
-        off += std::mem::size_of::<u64>();
-    }
-
-    // We are now entering the "Other register" section of the ARMv8-a architecture.
-    // First one, stack pointer.
-    let off = offset__of!(user_pt_regs, sp);
-    let id = arm64_core_reg_id!(KVM_REG_SIZE_U64, off);
-    state.push(Aarch64Register {
-        id,
-        value: vcpu
-            .get_one_reg(id)
-            .map_err(|err| Error::GetCoreRegister(err, "stack pointer".to_string()))?,
-    });
-
-    // Second one, the program counter.
-    let off = offset__of!(user_pt_regs, pc);
-    let id = arm64_core_reg_id!(KVM_REG_SIZE_U64, off);
-    state.push(Aarch64Register {
-        id,
-        value: vcpu
-            .get_one_reg(id)
-            .map_err(|err| Error::GetCoreRegister(err, "program counter".to_string()))?,
-    });
-
-    // Next is the processor state.
-    let off = offset__of!(user_pt_regs, pstate);
-    let id = arm64_core_reg_id!(KVM_REG_SIZE_U64, off);
-    state.push(Aarch64Register {
-        id,
-        value: vcpu
-            .get_one_reg(id)
-            .map_err(|err| Error::GetCoreRegister(err, "processor state".to_string()))?,
-    });
-
-    // The stack pointer associated with EL1.
-    let off = offset__of!(kvm_regs, sp_el1);
-    let id = arm64_core_reg_id!(KVM_REG_SIZE_U64, off);
-    state.push(Aarch64Register {
-        id,
-        value: vcpu
-            .get_one_reg(id)
-            .map_err(|err| Error::GetCoreRegister(err, "SP_EL1".to_string()))?,
-    });
-
-    // Exception Link Register for EL1, when taking an exception to EL1, this register
-    // holds the address to which to return afterwards.
-    let off = offset__of!(kvm_regs, elr_el1);
-    let id = arm64_core_reg_id!(KVM_REG_SIZE_U64, off);
-    state.push(Aarch64Register {
-        id,
-        value: vcpu
-            .get_one_reg(id)
-            .map_err(|err| Error::GetCoreRegister(err, "ELR_EL1".to_string()))?,
-    });
-
-    // Saved Program Status Registers, there are 5 of them used in the kernel.
-    let mut off = offset__of!(kvm_regs, spsr);
-    for i in 0..KVM_NR_SPSR {
-        let id = arm64_core_reg_id!(KVM_REG_SIZE_U64, off);
-        state.push(Aarch64Register {
-            id,
-            value: vcpu
-                .get_one_reg(id)
-                .map_err(|err| Error::GetCoreRegister(err, format!("SPSR{}", i)))?,
-        });
-        off += std::mem::size_of::<u64>();
-    }
-
-    // Now moving on to floating point registers which are stored in the user_fpsimd_state in the
-    // kernel: https://elixir.free-electrons.com/linux/v4.9.62/source/arch/arm64/include/uapi/asm/kvm.h#L53
-    let mut off = offset__of!(kvm_regs, fp_regs) + offset__of!(user_fpsimd_state, vregs);
-    for i in 0..NR_FP_VREGS {
-        let id = arm64_core_reg_id!(KVM_REG_SIZE_U128, off);
-        state.push(Aarch64Register {
-            id,
-            value: vcpu
-                .get_one_reg(id)
-                .map_err(|err| Error::GetCoreRegister(err, format!("FP_VREG{}", i)))?,
-        });
-        off += mem::size_of::<u128>();
-    }
-
-    // Floating-point Status Register.
-    let off = offset__of!(kvm_regs, fp_regs) + offset__of!(user_fpsimd_state, fpsr);
-    let id = arm64_core_reg_id!(KVM_REG_SIZE_U32, off);
-    state.push(Aarch64Register {
-        id,
-        value: vcpu
-            .get_one_reg(id)
-            .map_err(|err| Error::GetCoreRegister(err, "FPSR".to_string()))?,
-    });
-
-    // Floating-point Control Register.
-    let off = offset__of!(kvm_regs, fp_regs) + offset__of!(user_fpsimd_state, fpcr);
-    let id = arm64_core_reg_id!(KVM_REG_SIZE_U32, off);
-    state.push(Aarch64Register {
-        id,
-        value: vcpu
-            .get_one_reg(id)
-            .map_err(|err| Error::GetCoreRegister(err, "FPCR".to_string()))?,
-    });
-
-    Ok(())
+/// Returns register size in bytes
+pub fn reg_size(reg_id: u64) -> usize {
+    2_usize.pow(((reg_id & KVM_REG_SIZE_MASK) >> KVM_REG_SIZE_SHIFT) as u32)
 }
 
-/// Get the state of the system registers.
-///
-/// # Arguments
-///
-/// * `vcpu` - Structure for the VCPU that holds the VCPU's fd.
-/// * `state` - Structure for returning the state of the system registers.
-pub fn save_system_registers(vcpu: &VcpuFd, state: &mut Vec<Aarch64Register>) -> Result<()> {
-    // Call KVM_GET_REG_LIST to get all registers available to the guest. For ArmV8 there are
-    // less than 500 registers.
-    let mut reg_list = RegList::new(500).map_err(Error::Fam)?;
-    vcpu.get_reg_list(&mut reg_list)
-        .map_err(Error::GetRegList)?;
+/// Storage for aarch64 registers with different sizes.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub struct Aarch64RegisterVec {
+    ids: Vec<u64>,
+    data: Vec<u8>,
+}
 
-    // At this point reg_list should contain: core registers and system registers.
-    // The register list contains the number of registers and their ids. We will be needing to
-    // call KVM_GET_ONE_REG on each id in order to save all of them. We carve out from the list
-    // the core registers which are represented in the kernel by kvm_regs structure and for which
-    // we can calculate the id based on the offset in the structure.
-    reg_list.retain(|regid| is_system_register(*regid));
-
-    // Now, for the rest of the registers left in the previously fetched register list, we are
-    // simply calling KVM_GET_ONE_REG.
-    let indices = reg_list.as_slice();
-    for index in indices.iter() {
-        state.push(Aarch64Register {
-            id: *index,
-            value: vcpu.get_one_reg(*index).map_err(Error::GetSysRegister)?,
-        });
+impl Aarch64RegisterVec {
+    /// Returns the number of elements in the vector.
+    pub fn len(&self) -> usize {
+        self.ids.len()
     }
 
-    Ok(())
-}
-
-/// Set the state of the system registers.
-///
-/// # Arguments
-///
-/// * `vcpu` - Structure for the VCPU that holds the VCPU's fd.
-/// * `state` - Structure containing the state of the system registers.
-pub fn restore_registers(vcpu: &VcpuFd, state: &[Aarch64Register]) -> Result<()> {
-    for reg in state {
-        vcpu.set_one_reg(reg.id, reg.value)
-            .map_err(Error::SetRegister)?;
+    /// Returns true if the vector contains no elements.
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
     }
-    Ok(())
+
+    /// Appends a register to the vector, copying register data.
+    pub fn push(&mut self, reg: Aarch64RegisterRef<'_>) {
+        self.ids.push(reg.id);
+        self.data.extend_from_slice(reg.data);
+    }
+
+    /// Returns an iterator over stored registers.
+    pub fn iter(&self) -> impl Iterator<Item = Aarch64RegisterRef> {
+        Aarch64RegisterVecIterator {
+            index: 0,
+            offset: 0,
+            ids: &self.ids,
+            data: &self.data,
+        }
+    }
+
+    /// Returns an iterator over stored registers that allows register modifications.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = Aarch64RegisterRefMut> {
+        Aarch64RegisterVecIteratorMut {
+            index: 0,
+            offset: 0,
+            ids: &self.ids,
+            data: &mut self.data,
+        }
+    }
 }
 
-/// Get the multistate processor.
-///
-/// # Arguments
-///
-/// * `vcpu` - Structure for the VCPU that holds the VCPU's fd.
-pub fn get_mpstate(vcpu: &VcpuFd) -> Result<kvm_mp_state> {
-    vcpu.get_mp_state().map_err(Error::GetMP)
+impl Serialize for Aarch64RegisterVec {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        Serialize::serialize(&(&self.ids, &self.data), serializer)
+    }
 }
 
-/// Set the state of the system registers.
-///
-/// # Arguments
-///
-/// * `vcpu` - Structure for the VCPU that holds the VCPU's fd.
-/// * `state` - Structure for returning the state of the system registers.
-pub fn set_mpstate(vcpu: &VcpuFd, state: kvm_mp_state) -> Result<()> {
-    vcpu.set_mp_state(state).map_err(Error::SetMP)
+impl<'de> Deserialize<'de> for Aarch64RegisterVec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let (ids, data): (Vec<u64>, Vec<u8>) = Deserialize::deserialize(deserializer)?;
+
+        let mut total_size: usize = 0;
+        for id in ids.iter() {
+            let reg_size = reg_size(*id);
+            if reg_size > RegSize::U2048_SIZE {
+                return Err(serde::de::Error::custom(
+                    "Failed to deserialize aarch64 registers. Registers bigger than 2048 bits are \
+                     not supported",
+                ));
+            }
+            total_size += reg_size;
+        }
+
+        if total_size != data.len() {
+            return Err(serde::de::Error::custom(
+                "Failed to deserialize aarch64 registers. Sum of register sizes is not equal to \
+                 registers data length",
+            ));
+        }
+
+        Ok(Aarch64RegisterVec { ids, data })
+    }
 }
+
+/// Iterator over `Aarch64RegisterVec`.
+#[derive(Debug)]
+pub struct Aarch64RegisterVecIterator<'a> {
+    index: usize,
+    offset: usize,
+    ids: &'a [u64],
+    data: &'a [u8],
+}
+
+impl<'a> Iterator for Aarch64RegisterVecIterator<'a> {
+    type Item = Aarch64RegisterRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index < self.ids.len() {
+            let id = self.ids[self.index];
+            let reg_size = reg_size(id);
+            let reg_ref = Aarch64RegisterRef {
+                id,
+                data: &self.data[self.offset..self.offset + reg_size],
+            };
+            self.index += 1;
+            self.offset += reg_size;
+            Some(reg_ref)
+        } else {
+            None
+        }
+    }
+}
+
+/// Iterator over `Aarch64RegisterVec` with mutable values.
+#[derive(Debug)]
+pub struct Aarch64RegisterVecIteratorMut<'a> {
+    index: usize,
+    offset: usize,
+    ids: &'a [u64],
+    data: &'a mut [u8],
+}
+
+impl<'a> Iterator for Aarch64RegisterVecIteratorMut<'a> {
+    type Item = Aarch64RegisterRefMut<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index < self.ids.len() {
+            let id = self.ids[self.index];
+            let reg_size = reg_size(id);
+
+            let data = std::mem::take(&mut self.data);
+            let (head, tail) = data.split_at_mut(reg_size);
+
+            self.index += 1;
+            self.offset += reg_size;
+            self.data = tail;
+            Some(Aarch64RegisterRefMut { id, data: head })
+        } else {
+            None
+        }
+    }
+}
+
+/// Reference to the aarch64 register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Aarch64RegisterRef<'a> {
+    /// ID of the register
+    pub id: u64,
+    data: &'a [u8],
+}
+
+impl<'a> Aarch64RegisterRef<'a> {
+    /// Creates new register reference with provided id and data.
+    /// Register size in `id` should be equal to the
+    /// length of the slice. Otherwise this method
+    /// will panic.
+    pub fn new(id: u64, data: &'a [u8]) -> Self {
+        assert_eq!(
+            reg_size(id),
+            data.len(),
+            "Attempt to create a register reference with incompatible id and data length"
+        );
+
+        Self { id, data }
+    }
+
+    /// Returns register size in bytes
+    pub fn size(&self) -> RegSize {
+        reg_size(self.id).into()
+    }
+
+    /// Returns a register value.
+    /// Type `T` must be of the same length as an
+    /// underlying data slice. Otherwise this method
+    /// will panic.
+    pub fn value<T: Aarch64RegisterData<N>, const N: usize>(&self) -> T {
+        T::from_slice(self.data)
+    }
+
+    /// Returns register data as a byte slice
+    pub fn as_slice(&self) -> &[u8] {
+        self.data
+    }
+}
+
+/// Reference to the aarch64 register.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Aarch64RegisterRefMut<'a> {
+    /// ID of the register
+    pub id: u64,
+    data: &'a mut [u8],
+}
+
+impl<'a> Aarch64RegisterRefMut<'a> {
+    /// Creates new register reference with provided id and data.
+    /// Register size in `id` should be equal to the
+    /// length of the slice. Otherwise this method
+    /// will panic.
+    pub fn new(id: u64, data: &'a mut [u8]) -> Self {
+        assert_eq!(
+            reg_size(id),
+            data.len(),
+            "Attempt to create a register reference with incompatible id and data length"
+        );
+
+        Self { id, data }
+    }
+
+    /// Returns register size in bytes
+    pub fn size(&self) -> RegSize {
+        reg_size(self.id).into()
+    }
+
+    /// Returns a register value.
+    /// Type `T` must be of the same length as an
+    /// underlying data slice. Otherwise this method
+    /// will panic.
+    pub fn value<T: Aarch64RegisterData<N>, const N: usize>(&self) -> T {
+        T::from_slice(self.data)
+    }
+
+    /// Sets the register value.
+    /// Type `T` must be of the same length as an
+    /// underlying data slice. Otherwise this method
+    /// will panic.
+    pub fn set_value<T: Aarch64RegisterData<N>, const N: usize>(&mut self, value: T) {
+        self.data.copy_from_slice(&value.to_bytes())
+    }
+}
+
+/// Trait for data types that can represent aarch64
+/// register data.
+pub trait Aarch64RegisterData<const N: usize> {
+    /// Create data type from slice
+    fn from_slice(slice: &[u8]) -> Self;
+    /// Convert data type to array of bytes
+    fn to_bytes(&self) -> [u8; N];
+}
+
+macro_rules! reg_data {
+    ($t:ty, $bytes: expr) => {
+        impl Aarch64RegisterData<$bytes> for $t {
+            fn from_slice(slice: &[u8]) -> Self {
+                let mut bytes = [0_u8; $bytes];
+                bytes.copy_from_slice(slice);
+                <$t>::from_le_bytes(bytes)
+            }
+
+            fn to_bytes(&self) -> [u8; $bytes] {
+                self.to_le_bytes()
+            }
+        }
+    };
+}
+
+macro_rules! reg_data_array {
+    ($t:ty, $bytes: expr) => {
+        impl Aarch64RegisterData<$bytes> for $t {
+            fn from_slice(slice: &[u8]) -> Self {
+                let mut bytes = [0_u8; $bytes];
+                bytes.copy_from_slice(slice);
+                bytes
+            }
+
+            fn to_bytes(&self) -> [u8; $bytes] {
+                *self
+            }
+        }
+    };
+}
+
+reg_data!(u8, 1);
+reg_data!(u16, 2);
+reg_data!(u32, 4);
+reg_data!(u64, 8);
+reg_data!(u128, 16);
+// 256
+reg_data_array!([u8; 32], 32);
+// 512
+reg_data_array!([u8; 64], 64);
+// 1024
+reg_data_array!([u8; 128], 128);
+// 2048
+reg_data_array!([u8; 256], 256);
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::undocumented_unsafe_blocks)]
-    use kvm_ioctls::Kvm;
-
     use super::*;
-    use crate::arch::aarch64::{arch_memory_regions, layout};
+    use crate::snapshot::Snapshot;
 
     #[test]
-    fn test_setup_regs() {
-        let kvm = Kvm::new().unwrap();
-        let vm = kvm.create_vm().unwrap();
-        let vcpu = vm.create_vcpu(0).unwrap();
-        let regions = arch_memory_regions(layout::FDT_MAX_SIZE + 0x1000);
-        let mem = utils::vm_memory::test_utils::create_anon_guest_memory(&regions, false)
-            .expect("Cannot initialize memory");
-
-        let res = setup_boot_regs(&vcpu, 0, 0x0, &mem);
-        assert!(res.is_err());
-        assert_eq!(
-            format!("{}", res.unwrap_err()),
-            "Failed to set processor state register: Exec format error (os error 8)"
-        );
-
-        let mut kvi: kvm_bindings::kvm_vcpu_init = kvm_bindings::kvm_vcpu_init::default();
-        vm.get_preferred_target(&mut kvi).unwrap();
-        vcpu.vcpu_init(&kvi).unwrap();
-
-        setup_boot_regs(&vcpu, 0, 0x0, &mem).unwrap();
-    }
-    #[test]
-    fn test_read_mpidr() {
-        let kvm = Kvm::new().unwrap();
-        let vm = kvm.create_vm().unwrap();
-        let vcpu = vm.create_vcpu(0).unwrap();
-        let mut kvi: kvm_bindings::kvm_vcpu_init = kvm_bindings::kvm_vcpu_init::default();
-        vm.get_preferred_target(&mut kvi).unwrap();
-
-        // Must fail when vcpu is not initialized yet.
-        let res = read_mpidr(&vcpu);
-        assert!(res.is_err());
-        assert_eq!(
-            format!("{}", res.unwrap_err()),
-            "Failed to get system register: Exec format error (os error 8)"
-        );
-
-        vcpu.vcpu_init(&kvi).unwrap();
-        assert_eq!(read_mpidr(&vcpu).unwrap(), 0x8000_0000);
+    fn test_reg_size() {
+        assert_eq!(reg_size(KVM_REG_SIZE_U32), 4);
+        // ID_AA64PFR0_EL1 is 64 bit register
+        assert_eq!(reg_size(ID_AA64PFR0_EL1), 8);
     }
 
     #[test]
-    fn test_is_system_register() {
-        let offset = offset__of!(user_pt_regs, pc);
-        let regid = arm64_core_reg_id!(KVM_REG_SIZE_U64, offset);
-        assert!(!is_system_register(regid));
-        let regid =
-            KVM_REG_ARM64 | KVM_REG_SIZE_U64 | u64::from(kvm_bindings::KVM_REG_ARM64_SYSREG);
-        assert!(is_system_register(regid));
+    fn test_aarch64_register_vec_serde() {
+        let mut v = Aarch64RegisterVec::default();
+
+        let reg1_bytes = 1_u8.to_le_bytes();
+        let reg1 = Aarch64RegisterRef::new(u64::from(KVM_REG_SIZE_U8), &reg1_bytes);
+        let reg2_bytes = 2_u16.to_le_bytes();
+        let reg2 = Aarch64RegisterRef::new(KVM_REG_SIZE_U16, &reg2_bytes);
+
+        v.push(reg1);
+        v.push(reg2);
+
+        let mut buf = vec![0; 10000];
+
+        Snapshot::serialize(&mut buf.as_mut_slice(), &v).unwrap();
+        let restored: Aarch64RegisterVec = Snapshot::deserialize(&mut buf.as_slice()).unwrap();
+
+        for (old, new) in v.iter().zip(restored.iter()) {
+            assert_eq!(old, new);
+        }
     }
 
+    #[test]
+    fn test_aarch64_register_vec_serde_invalid_regs_size_sum() {
+        let mut v = Aarch64RegisterVec::default();
+
+        let reg1_bytes = 1_u8.to_le_bytes();
+        // Creating invalid register with incompatible ID and reg size.
+        let reg1 = Aarch64RegisterRef {
+            id: KVM_REG_SIZE_U16,
+            data: &reg1_bytes,
+        };
+        let reg2_bytes = 2_u16.to_le_bytes();
+        let reg2 = Aarch64RegisterRef::new(KVM_REG_SIZE_U16, &reg2_bytes);
+
+        v.push(reg1);
+        v.push(reg2);
+
+        let mut buf = vec![0; 10000];
+
+        Snapshot::serialize(&mut buf.as_mut_slice(), &v).unwrap();
+
+        // Total size of registers according IDs are 16 + 16 = 32,
+        // but actual data size is 8 + 16 = 24.
+        Snapshot::deserialize::<_, Aarch64RegisterVec>(&mut buf.as_slice()).unwrap_err();
+    }
+
+    #[test]
+    fn test_aarch64_register_vec_serde_invalid_reg_size() {
+        let mut v = Aarch64RegisterVec::default();
+
+        let reg_bytes = [0_u8; 512];
+        // Creating invalid register with incompatible size.
+        // 512 bytes for 4096 bit wide register.
+        let reg = Aarch64RegisterRef {
+            id: 0x0090000000000000,
+            data: &reg_bytes,
+        };
+
+        v.push(reg);
+
+        let mut buf = vec![0; 10000];
+
+        Snapshot::serialize(&mut buf.as_mut_slice(), &v).unwrap();
+
+        // 4096 bit wide registers are not supported.
+        Snapshot::deserialize::<_, Aarch64RegisterVec>(&mut buf.as_slice()).unwrap_err();
+    }
+
+    #[test]
+    fn test_aarch64_register_vec() {
+        let mut v = Aarch64RegisterVec::default();
+
+        let reg1_bytes = 1_u8.to_le_bytes();
+        let reg1 = Aarch64RegisterRef::new(u64::from(KVM_REG_SIZE_U8), &reg1_bytes);
+        let reg2_bytes = 2_u16.to_le_bytes();
+        let reg2 = Aarch64RegisterRef::new(KVM_REG_SIZE_U16, &reg2_bytes);
+        let reg3_bytes = 3_u32.to_le_bytes();
+        let reg3 = Aarch64RegisterRef::new(KVM_REG_SIZE_U32, &reg3_bytes);
+        let reg4_bytes = 4_u64.to_le_bytes();
+        let reg4 = Aarch64RegisterRef::new(KVM_REG_SIZE_U64, &reg4_bytes);
+        let reg5_bytes = 5_u128.to_le_bytes();
+        let reg5 = Aarch64RegisterRef::new(KVM_REG_SIZE_U128, &reg5_bytes);
+        let reg6 = Aarch64RegisterRef::new(KVM_REG_SIZE_U256, &[6; 32]);
+        let reg7 = Aarch64RegisterRef::new(KVM_REG_SIZE_U512, &[7; 64]);
+        let reg8 = Aarch64RegisterRef::new(KVM_REG_SIZE_U1024, &[8; 128]);
+        let reg9 = Aarch64RegisterRef::new(KVM_REG_SIZE_U2048, &[9; 256]);
+
+        v.push(reg1);
+        v.push(reg2);
+        v.push(reg3);
+        v.push(reg4);
+        v.push(reg5);
+        v.push(reg6);
+        v.push(reg7);
+        v.push(reg8);
+        v.push(reg9);
+
+        assert!(!v.is_empty());
+        assert_eq!(v.len(), 9);
+
+        // Test iter
+        {
+            macro_rules! test_iter {
+                ($iter:expr, $size: expr, $t:ty, $bytes:expr, $value:expr) => {
+                    let reg_ref = $iter.next().unwrap();
+                    assert_eq!(reg_ref.id, u64::from($size));
+                    assert_eq!(reg_ref.value::<$t, $bytes>(), $value);
+                };
+            }
+
+            let mut regs_iter = v.iter();
+
+            test_iter!(regs_iter, KVM_REG_SIZE_U8, u8, 1, 1);
+            test_iter!(regs_iter, KVM_REG_SIZE_U16, u16, 2, 2);
+            test_iter!(regs_iter, KVM_REG_SIZE_U32, u32, 4, 3);
+            test_iter!(regs_iter, KVM_REG_SIZE_U64, u64, 8, 4);
+            test_iter!(regs_iter, KVM_REG_SIZE_U128, u128, 16, 5);
+            test_iter!(regs_iter, KVM_REG_SIZE_U256, [u8; 32], 32, [6; 32]);
+            test_iter!(regs_iter, KVM_REG_SIZE_U512, [u8; 64], 64, [7; 64]);
+            test_iter!(regs_iter, KVM_REG_SIZE_U1024, [u8; 128], 128, [8; 128]);
+            test_iter!(regs_iter, KVM_REG_SIZE_U2048, [u8; 256], 256, [9; 256]);
+
+            assert!(regs_iter.next().is_none());
+        }
+
+        // Test iter mut
+        {
+            {
+                macro_rules! update_value {
+                    ($iter:expr, $t:ty, $bytes:expr) => {
+                        let mut reg_ref = $iter.next().unwrap();
+                        reg_ref.set_value(reg_ref.value::<$t, $bytes>() - 1);
+                    };
+                }
+
+                let mut regs_iter_mut = v.iter_mut();
+
+                update_value!(regs_iter_mut, u8, 1);
+                update_value!(regs_iter_mut, u16, 2);
+                update_value!(regs_iter_mut, u32, 4);
+                update_value!(regs_iter_mut, u64, 8);
+                update_value!(regs_iter_mut, u128, 16);
+            }
+
+            {
+                macro_rules! test_iter {
+                    ($iter:expr, $t:ty, $bytes:expr, $value:expr) => {
+                        let reg_ref = $iter.next().unwrap();
+                        assert_eq!(reg_ref.value::<$t, $bytes>(), $value);
+                    };
+                }
+
+                let mut regs_iter = v.iter();
+
+                test_iter!(regs_iter, u8, 1, 0);
+                test_iter!(regs_iter, u16, 2, 1);
+                test_iter!(regs_iter, u32, 4, 2);
+                test_iter!(regs_iter, u64, 8, 3);
+                test_iter!(regs_iter, u128, 16, 4);
+            }
+        }
+    }
+
+    #[test]
+    fn test_reg_ref() {
+        let bytes = 69_u64.to_le_bytes();
+        let reg_ref = Aarch64RegisterRef::new(KVM_REG_SIZE_U64, &bytes);
+
+        assert_eq!(usize::from(reg_ref.size()), 8);
+        assert_eq!(reg_ref.value::<u64, 8>(), 69);
+    }
+
+    /// Should panic because ID has different size from a slice length.
+    /// - Size in ID: 128
+    /// - Length of slice: 1
     #[test]
     #[should_panic]
-    fn test_is_not_system_register() {
-        assert!(is_system_register(0));
+    fn test_reg_ref_new_must_panic() {
+        let _ = Aarch64RegisterRef::new(KVM_REG_SIZE_U128, &[0; 1]);
+    }
+
+    /// Should panic because of incorrect cast to value.
+    /// - Reference contains 64 bit register
+    /// - Casting to 128 bits.
+    #[test]
+    #[should_panic]
+    fn test_reg_ref_value_must_panic() {
+        let bytes = 69_u64.to_le_bytes();
+        let reg_ref = Aarch64RegisterRef::new(KVM_REG_SIZE_U64, &bytes);
+        assert_eq!(reg_ref.value::<u128, 16>(), 69);
     }
 
     #[test]
-    fn test_save_restore_regs() {
-        let kvm = Kvm::new().unwrap();
-        let vm = kvm.create_vm().unwrap();
-        let vcpu = vm.create_vcpu(0).unwrap();
-        let mut kvi: kvm_bindings::kvm_vcpu_init = kvm_bindings::kvm_vcpu_init::default();
-        vm.get_preferred_target(&mut kvi).unwrap();
+    fn test_reg_ref_mut() {
+        let mut bytes = 69_u64.to_le_bytes();
+        let mut reg_ref = Aarch64RegisterRefMut::new(KVM_REG_SIZE_U64, &mut bytes);
 
-        // Must fail when vcpu is not initialized yet.
-        let mut state = Vec::new();
-        let res = save_core_registers(&vcpu, &mut state);
-        assert!(res.is_err());
-        assert_eq!(
-            format!("{}", res.unwrap_err()),
-            "Failed to get X0 register: Exec format error (os error 8)"
-        );
-
-        let res = save_system_registers(&vcpu, &mut state);
-        assert!(res.is_err());
-        assert_eq!(
-            format!("{}", res.unwrap_err()),
-            "Failed to retrieve list of registers: Exec format error (os error 8)"
-        );
-
-        vcpu.vcpu_init(&kvi).unwrap();
-        save_core_registers(&vcpu, &mut state).unwrap();
-        save_system_registers(&vcpu, &mut state).unwrap();
-
-        restore_registers(&vcpu, &state).unwrap();
-        let off = offset__of!(user_pt_regs, pstate);
-        let id = arm64_core_reg_id!(KVM_REG_SIZE_U64, off);
-        let pstate = vcpu
-            .get_one_reg(id)
-            .expect("Failed to call kvm get one reg");
-        assert!(state.contains(&Aarch64Register { id, value: pstate }));
+        assert_eq!(usize::from(reg_ref.size()), 8);
+        assert_eq!(reg_ref.value::<u64, 8>(), 69);
+        reg_ref.set_value(reg_ref.value::<u64, 8>() + 1);
+        assert_eq!(reg_ref.value::<u64, 8>(), 70);
     }
 
+    /// Should panic because ID has different size from a slice length.
+    /// - Size in ID: 128
+    /// - Length of slice: 1
     #[test]
-    fn test_mpstate() {
-        use std::os::unix::io::AsRawFd;
+    #[should_panic]
+    fn test_reg_ref_mut_new_must_panic() {
+        let _ = Aarch64RegisterRefMut::new(KVM_REG_SIZE_U128, &mut [0; 1]);
+    }
 
-        let kvm = Kvm::new().unwrap();
-        let vm = kvm.create_vm().unwrap();
-        let vcpu = vm.create_vcpu(0).unwrap();
-        let mut kvi: kvm_bindings::kvm_vcpu_init = kvm_bindings::kvm_vcpu_init::default();
-        vm.get_preferred_target(&mut kvi).unwrap();
-
-        let res = get_mpstate(&vcpu);
-        assert!(res.is_ok());
-        assert!(set_mpstate(&vcpu, res.unwrap()).is_ok());
-
-        unsafe { libc::close(vcpu.as_raw_fd()) };
-
-        let res = get_mpstate(&vcpu);
-        assert!(res.is_err());
-        assert_eq!(
-            res.unwrap_err().to_string(),
-            "Failed to get multiprocessor state: Bad file descriptor (os error 9)"
-        );
-
-        let res = set_mpstate(&vcpu, kvm_mp_state::default());
-        assert!(res.is_err());
-        assert_eq!(
-            res.unwrap_err().to_string(),
-            "Failed to set multiprocessor state: Bad file descriptor (os error 9)"
-        );
+    /// Should panic because of incorrect cast to value.
+    /// - Reference contains 64 bit register
+    /// - Casting to 128 bits.
+    #[test]
+    #[should_panic]
+    fn test_reg_ref_mut_must_panic() {
+        let mut bytes = 69_u64.to_le_bytes();
+        let reg_ref = Aarch64RegisterRefMut::new(KVM_REG_SIZE_U64, &mut bytes);
+        assert_eq!(reg_ref.value::<u128, 16>(), 69);
     }
 }

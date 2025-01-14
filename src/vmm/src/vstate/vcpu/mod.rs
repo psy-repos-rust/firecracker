@@ -6,99 +6,112 @@
 // found in the THIRD-PARTY file.
 
 use std::cell::Cell;
+#[cfg(feature = "gdb")]
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{fence, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
-#[cfg(test)]
-use std::sync::Mutex;
 use std::sync::{Arc, Barrier};
-use std::{fmt, io, result, thread};
+use std::{fmt, io, thread};
 
 use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
 use kvm_ioctls::VcpuExit;
+#[cfg(feature = "gdb")]
+use kvm_ioctls::VcpuFd;
 use libc::{c_int, c_void, siginfo_t};
-use logger::{error, info, IncMetric, METRICS};
+use log::{error, info, warn};
 use seccompiler::{BpfProgram, BpfProgramRef};
-use utils::errno;
-use utils::eventfd::EventFd;
-use utils::signal::{register_signal_handler, sigrtmin, Killable};
-use utils::sm::StateMachine;
+use vmm_sys_util::errno;
+use vmm_sys_util::eventfd::EventFd;
 
-use crate::vmm_config::machine_config::CpuFeaturesTemplate;
+use crate::cpu_config::templates::{CpuConfiguration, GuestConfigError};
+#[cfg(feature = "gdb")]
+use crate::gdb::target::{get_raw_tid, GdbTargetError};
+use crate::logger::{IncMetric, METRICS};
+use crate::utils::signal::{register_signal_handler, sigrtmin, Killable};
+use crate::utils::sm::StateMachine;
 use crate::vstate::vm::Vm;
 use crate::FcExitCode;
 
+/// Module with aarch64 vCPU implementation.
 #[cfg(target_arch = "aarch64")]
-pub(crate) mod aarch64;
+pub mod aarch64;
+/// Module with x86_64 vCPU implementation.
 #[cfg(target_arch = "x86_64")]
-pub(crate) mod x86_64;
+pub mod x86_64;
 
 #[cfg(target_arch = "aarch64")]
-pub(crate) use aarch64::{Error as VcpuError, *};
+pub use aarch64::{KvmVcpuError, *};
 #[cfg(target_arch = "x86_64")]
-pub(crate) use x86_64::{Error as VcpuError, *};
+pub use x86_64::{KvmVcpuError, *};
 
 /// Signal number (SIGRTMIN) used to kick Vcpus.
-pub(crate) const VCPU_RTSIG_OFFSET: i32 = 0;
+pub const VCPU_RTSIG_OFFSET: i32 = 0;
 
 /// Errors associated with the wrappers over KVM ioctls.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// Error triggered by the KVM subsystem.
-    #[error("Received error signaling kvm exit: {0}")]
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum VcpuError {
+    /// Error creating vcpu config: {0}
+    VcpuConfig(GuestConfigError),
+    /// Received error signaling kvm exit: {0}
     FaultyKvmExit(String),
-    /// Failed to signal Vcpu.
-    #[error("Failed to signal vcpu: {0}")]
-    SignalVcpu(utils::errno::Error),
-    /// Kvm Exit is not handled by our implementation.
-    #[error("Unexpected kvm exit received: {0}")]
+    /// Failed to signal vcpu: {0}
+    SignalVcpu(vmm_sys_util::errno::Error),
+    /// Unexpected kvm exit received: {0}
     UnhandledKvmExit(String),
-    /// Wrapper over error triggered by some vcpu action.
-    #[error("Failed to run action on vcpu: {0}")]
-    VcpuResponse(VcpuError),
-    /// Cannot spawn a new vCPU thread.
-    #[error("Cannot spawn a new vCPU thread: {0}")]
+    /// Failed to run action on vcpu: {0}
+    VcpuResponse(KvmVcpuError),
+    /// Cannot spawn a new vCPU thread: {0}
     VcpuSpawn(io::Error),
-    /// Cannot cleanly initialize vcpu TLS.
-    #[error("Cannot clean init vcpu TLS")]
+    /// Cannot clean init vcpu TLS
     VcpuTlsInit,
-    /// Vcpu not present in TLS.
-    #[error("Vcpu not present in TLS")]
+    /// Vcpu not present in TLS
     VcpuTlsNotPresent,
+    /// Error with gdb request sent
+    #[cfg(feature = "gdb")]
+    GdbRequest(GdbTargetError),
 }
 
-pub type Result<T> = result::Result<T, Error>;
-
 /// Encapsulates configuration parameters for the guest vCPUS.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct VcpuConfig {
     /// Number of guest VCPUs.
     pub vcpu_count: u8,
     /// Enable simultaneous multithreading in the CPUID configuration.
     pub smt: bool,
-    /// CPUID template to use.
-    pub cpu_template: CpuFeaturesTemplate,
+    /// Configuration for vCPU
+    pub cpu_config: CpuConfiguration,
 }
 
 // Using this for easier explicit type-casting to help IDEs interpret the code.
-type VcpuCell = Cell<Option<*const Vcpu>>;
+type VcpuCell = Cell<Option<*mut Vcpu>>;
 
 /// Error type for [`Vcpu::start_threaded`].
-#[derive(Debug, derive_more::From)]
+#[derive(Debug, derive_more::From, thiserror::Error)]
+#[error("Failed to spawn vCPU thread: {0}")]
 pub struct StartThreadedError(std::io::Error);
-impl std::error::Error for StartThreadedError {}
-impl fmt::Display for StartThreadedError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Failed to spawn vCPU thread: {}", self.0)
-    }
+
+/// Error type for [`Vcpu::copy_kvm_vcpu_fd`].
+#[cfg(feature = "gdb")]
+#[derive(Debug, thiserror::Error)]
+#[error("Failed to clone kvm Vcpu fd: {0}")]
+pub enum CopyKvmFdError {
+    /// Error with libc dup of kvm Vcpu fd
+    DupError(#[from] std::io::Error),
+    /// Error creating the Vcpu from the duplicated Vcpu fd
+    CreateVcpuError(#[from] kvm_ioctls::Error),
 }
 
 /// A wrapper around creating and using a vcpu.
+#[derive(Debug)]
 pub struct Vcpu {
     /// Access to kvm-arch specific functionality.
     pub kvm_vcpu: KvmVcpu,
 
     /// File descriptor for vcpu to trigger exit event on vmm.
     exit_evt: EventFd,
+    /// Debugger emitter for gdb events
+    #[cfg(feature = "gdb")]
+    gdb_event: Option<Sender<usize>>,
     /// The receiving end of events channel owned by the vcpu side.
     event_receiver: Receiver<VcpuEvent>,
     /// The transmitting end of the events channel which will be given to the handler.
@@ -107,26 +120,22 @@ pub struct Vcpu {
     response_receiver: Option<Receiver<VcpuResponse>>,
     /// The transmitting end of the responses channel owned by the vcpu side.
     response_sender: Sender<VcpuResponse>,
-
-    /// Exit reason used to test run_emulation function.
-    #[cfg(test)]
-    test_vcpu_exit_reason: Mutex<Option<std::result::Result<VcpuExit<'static>, errno::Error>>>,
 }
 
 impl Vcpu {
-    thread_local!(static TLS_VCPU_PTR: VcpuCell = Cell::new(None));
+    thread_local!(static TLS_VCPU_PTR: VcpuCell = const { Cell::new(None) });
 
     /// Associates `self` with the current thread.
     ///
     /// It is a prerequisite to successfully run `init_thread_local_data()` before using
     /// `run_on_thread_local()` on the current thread.
     /// This function will return an error if there already is a `Vcpu` present in the TLS.
-    fn init_thread_local_data(&mut self) -> Result<()> {
+    fn init_thread_local_data(&mut self) -> Result<(), VcpuError> {
         Self::TLS_VCPU_PTR.with(|cell: &VcpuCell| {
             if cell.get().is_some() {
-                return Err(Error::VcpuTlsInit);
+                return Err(VcpuError::VcpuTlsInit);
             }
-            cell.set(Some(self as *const Vcpu));
+            cell.set(Some(self as *mut Vcpu));
             Ok(())
         })
     }
@@ -137,17 +146,17 @@ impl Vcpu {
     /// now needs to move to a different thread.
     ///
     /// Fails if `self` was not previously associated with the current thread.
-    fn reset_thread_local_data(&mut self) -> Result<()> {
+    fn reset_thread_local_data(&mut self) -> Result<(), VcpuError> {
         // Best-effort to clean up TLS. If the `Vcpu` was moved to another thread
         // _before_ running this, then there is nothing we can do.
         Self::TLS_VCPU_PTR.with(|cell: &VcpuCell| {
             if let Some(vcpu_ptr) = cell.get() {
-                if vcpu_ptr == self as *const Vcpu {
+                if vcpu_ptr == self as *mut Vcpu {
                     Self::TLS_VCPU_PTR.with(|cell: &VcpuCell| cell.take());
                     return Ok(());
                 }
             }
-            Err(Error::VcpuTlsNotPresent)
+            Err(VcpuError::VcpuTlsNotPresent)
         })
     }
 
@@ -161,19 +170,19 @@ impl Vcpu {
     ///
     /// This is marked unsafe as it allows temporary aliasing through
     /// dereferencing from pointer an already borrowed `Vcpu`.
-    unsafe fn run_on_thread_local<F>(func: F) -> Result<()>
+    unsafe fn run_on_thread_local<F>(func: F) -> Result<(), VcpuError>
     where
-        F: FnOnce(&Vcpu),
+        F: FnOnce(&mut Vcpu),
     {
         Self::TLS_VCPU_PTR.with(|cell: &VcpuCell| {
             if let Some(vcpu_ptr) = cell.get() {
                 // Dereferencing here is safe since `TLS_VCPU_PTR` is populated/non-empty,
                 // and it is being cleared on `Vcpu::drop` so there is no dangling pointer.
-                let vcpu_ref: &Vcpu = &*vcpu_ptr;
+                let vcpu_ref = &mut *vcpu_ptr;
                 func(vcpu_ref);
                 Ok(())
             } else {
-                Err(Error::VcpuTlsNotPresent)
+                Err(VcpuError::VcpuTlsNotPresent)
             }
         })
     }
@@ -203,7 +212,7 @@ impl Vcpu {
     /// * `index` - Represents the 0-based CPU index between [0, max vcpus).
     /// * `vm` - The vm to which this vcpu will get attached.
     /// * `exit_evt` - An `EventFd` that will be written into when this vcpu exits.
-    pub fn new(index: u8, vm: &Vm, exit_evt: EventFd) -> Result<Self> {
+    pub fn new(index: u8, vm: &Vm, exit_evt: EventFd) -> Result<Self, VcpuError> {
         let (event_sender, event_receiver) = channel();
         let (response_sender, response_receiver) = channel();
         let kvm_vcpu = KvmVcpu::new(index, vm).unwrap();
@@ -214,15 +223,33 @@ impl Vcpu {
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
             response_sender,
+            #[cfg(feature = "gdb")]
+            gdb_event: None,
             kvm_vcpu,
-            #[cfg(test)]
-            test_vcpu_exit_reason: Mutex::new(None),
         })
     }
 
     /// Sets a MMIO bus for this vcpu.
-    pub fn set_mmio_bus(&mut self, mmio_bus: devices::Bus) {
-        self.kvm_vcpu.mmio_bus = Some(mmio_bus);
+    pub fn set_mmio_bus(&mut self, mmio_bus: crate::devices::Bus) {
+        self.kvm_vcpu.peripherals.mmio_bus = Some(mmio_bus);
+    }
+
+    /// Attaches the fields required for debugging
+    #[cfg(feature = "gdb")]
+    pub fn attach_debug_info(&mut self, gdb_event: Sender<usize>) {
+        self.gdb_event = Some(gdb_event);
+    }
+
+    /// Obtains a copy of the VcpuFd
+    #[cfg(feature = "gdb")]
+    pub fn copy_kvm_vcpu_fd(&self, vm: &Vm) -> Result<VcpuFd, CopyKvmFdError> {
+        // SAFETY: We own this fd so it is considered safe to clone
+        let r = unsafe { libc::dup(self.kvm_vcpu.fd.as_raw_fd()) };
+        if r < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: We assert this is a valid fd by checking the result from the dup
+        unsafe { Ok(vm.fd().create_vcpu_from_rawfd(r)?) }
     }
 
     /// Moves the vcpu to its own thread and constructs a VcpuHandle.
@@ -231,7 +258,7 @@ impl Vcpu {
         mut self,
         seccomp_filter: Arc<BpfProgram>,
         barrier: Arc<Barrier>,
-    ) -> std::result::Result<VcpuHandle, StartThreadedError> {
+    ) -> Result<VcpuHandle, StartThreadedError> {
         let event_sender = self.event_sender.take().expect("vCPU already started");
         let response_receiver = self.response_receiver.take().unwrap();
         let vcpu_thread = thread::Builder::new()
@@ -287,6 +314,11 @@ impl Vcpu {
                 // - the other vCPUs won't ever exit out of `KVM_RUN`, but they won't consume CPU.
                 // So we pause vCPU0 and send a signal to the emulation thread to stop the VMM.
                 Ok(VcpuEmulation::Stopped) => return self.exit(FcExitCode::Ok),
+                // If the emulation requests a pause lets do this
+                #[cfg(feature = "gdb")]
+                Ok(VcpuEmulation::Paused) => {
+                    return StateMachine::next(Self::paused);
+                }
                 // Emulation errors lead to vCPU exit.
                 Err(_) => return self.exit(FcExitCode::GenericError),
             }
@@ -302,10 +334,17 @@ impl Vcpu {
                 // Nothing special to do.
                 self.response_sender
                     .send(VcpuResponse::Paused)
-                    .expect("failed to send pause status");
+                    .expect("vcpu channel unexpectedly closed");
 
-                // TODO: we should call `KVM_KVMCLOCK_CTRL` here to make sure
-                // TODO continued: the guest soft lockup watchdog does not panic on Resume.
+                // Calling `KVM_KVMCLOCK_CTRL` to make sure the guest softlockup watchdog
+                // does not panic on resume, see https://docs.kernel.org/virt/kvm/api.html .
+                // We do not want to fail if the call is not successful, because depending
+                // that may be acceptable depending on the workload.
+                #[cfg(target_arch = "x86_64")]
+                if let Err(err) = self.kvm_vcpu.fd.kvmclock_ctrl() {
+                    METRICS.vcpu.kvmclock_ctrl_fails.inc();
+                    warn!("KVM_KVMCLOCK_CTRL call failed {}", err);
+                }
 
                 // Move to 'paused' state.
                 state = StateMachine::next(Self::paused);
@@ -313,15 +352,23 @@ impl Vcpu {
             Ok(VcpuEvent::Resume) => {
                 self.response_sender
                     .send(VcpuResponse::Resumed)
-                    .expect("failed to send resume status");
+                    .expect("vcpu channel unexpectedly closed");
             }
-            // SaveState or RestoreState cannot be performed on a running Vcpu.
-            Ok(VcpuEvent::SaveState) | Ok(VcpuEvent::RestoreState(_)) => {
+            // SaveState cannot be performed on a running Vcpu.
+            Ok(VcpuEvent::SaveState) => {
                 self.response_sender
                     .send(VcpuResponse::NotAllowed(String::from(
                         "save/restore unavailable while running",
                     )))
-                    .expect("failed to send save not allowed status");
+                    .expect("vcpu channel unexpectedly closed");
+            }
+            // DumpCpuConfig cannot be performed on a running Vcpu.
+            Ok(VcpuEvent::DumpCpuConfig) => {
+                self.response_sender
+                    .send(VcpuResponse::NotAllowed(String::from(
+                        "cpu config dump is unavailable while running",
+                    )))
+                    .expect("vcpu channel unexpectedly closed");
             }
             Ok(VcpuEvent::Finish) => return StateMachine::finish(),
             // Unhandled exit of the other end.
@@ -341,6 +388,13 @@ impl Vcpu {
         match self.event_receiver.recv() {
             // Paused ---- Resume ----> Running
             Ok(VcpuEvent::Resume) => {
+                if self.kvm_vcpu.fd.get_kvm_run().immediate_exit == 1u8 {
+                    warn!(
+                        "Received a VcpuEvent::Resume message with immediate_exit enabled. \
+                         immediate_exit was disabled before proceeding"
+                    );
+                    self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
+                }
                 // Nothing special to do.
                 self.response_sender
                     .send(VcpuResponse::Resumed)
@@ -365,24 +419,24 @@ impl Vcpu {
                     })
                     .unwrap_or_else(|err| {
                         self.response_sender
-                            .send(VcpuResponse::Error(Error::VcpuResponse(err)))
+                            .send(VcpuResponse::Error(VcpuError::VcpuResponse(err)))
                             .expect("vcpu channel unexpectedly closed");
                     });
 
                 StateMachine::next(Self::paused)
             }
-            Ok(VcpuEvent::RestoreState(vcpu_state)) => {
+            Ok(VcpuEvent::DumpCpuConfig) => {
                 self.kvm_vcpu
-                    .restore_state(&vcpu_state)
-                    .map(|()| {
+                    .dump_cpu_config()
+                    .map(|cpu_config| {
                         self.response_sender
-                            .send(VcpuResponse::RestoredState)
+                            .send(VcpuResponse::DumpedCpuConfig(Box::new(cpu_config)))
                             .expect("vcpu channel unexpectedly closed");
                     })
                     .unwrap_or_else(|err| {
                         self.response_sender
-                            .send(VcpuResponse::Error(Error::VcpuResponse(err)))
-                            .expect("vcpu channel unexpectedly closed")
+                            .send(VcpuResponse::Error(VcpuError::VcpuResponse(err)))
+                            .expect("vcpu channel unexpectedly closed");
                     });
 
                 StateMachine::next(Self::paused)
@@ -399,9 +453,9 @@ impl Vcpu {
     // Transition to the exited state and finish on command.
     fn exit(&mut self, exit_code: FcExitCode) -> StateMachine<Self> {
         // To avoid cycles, all teardown paths take the following route:
-        // +------------------------+----------------------------+------------------------+
-        // |        Vmm             |           Action           |           Vcpu         |
-        // +------------------------+----------------------------+------------------------+
+        //   +------------------------+----------------------------+------------------------+
+        //   |        Vmm             |           Action           |           Vcpu         |
+        //   +------------------------+----------------------------+------------------------+
         // 1 |                        |                            | vcpu.exit(exit_code)   |
         // 2 |                        |                            | vcpu.exit_evt.write(1) |
         // 3 |                        | <--- EventFd::exit_evt --- |                        |
@@ -410,7 +464,7 @@ impl Vcpu {
         // 6 |                        |                            | StateMachine::finish() |
         // 7 | VcpuHandle::join()     |                            |                        |
         // 8 | vmm.shutdown_exit_code becomes Some(exit_code) breaking the main event loop  |
-        // +------------------------+----------------------------+------------------------+
+        //   +------------------------+----------------------------+------------------------+
         // Vcpu initiated teardown starts from `fn Vcpu::exit()` (step 1).
         // Vmm initiated teardown starts from `pub fn Vmm::stop()` (step 4).
         // Once `vmm.shutdown_exit_code` becomes `Some(exit_code)`, it is the upper layer's
@@ -433,119 +487,134 @@ impl Vcpu {
         StateMachine::finish()
     }
 
-    #[cfg(not(test))]
-    /// Calls `KVM_RUN` with this [`Vcpu`]'s underlying file descriptor.
-    ///
-    /// Blocks until a `VM_EXIT` is received, in which case this function returns a [`VcpuExit`]
-    /// containing the reason.
-    pub fn emulate(&self) -> std::result::Result<VcpuExit, errno::Error> {
-        self.kvm_vcpu.fd.run()
-    }
-
     /// Runs the vCPU in KVM context and handles the kvm exit reason.
     ///
     /// Returns error or enum specifying whether emulation was handled or interrupted.
-    pub fn run_emulation(&self) -> Result<VcpuEmulation> {
-        match self.emulate() {
-            Ok(run) => match run {
-                VcpuExit::MmioRead(addr, data) => {
-                    if let Some(mmio_bus) = &self.kvm_vcpu.mmio_bus {
-                        mmio_bus.read(addr, data);
-                        METRICS.vcpu.exit_mmio_read.inc();
-                    }
-                    Ok(VcpuEmulation::Handled)
+    pub fn run_emulation(&mut self) -> Result<VcpuEmulation, VcpuError> {
+        if self.kvm_vcpu.fd.get_kvm_run().immediate_exit == 1u8 {
+            warn!("Requested a vCPU run with immediate_exit enabled. The operation was skipped");
+            self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
+            return Ok(VcpuEmulation::Interrupted);
+        }
+
+        match self.kvm_vcpu.fd.run() {
+            Err(ref err) if err.errno() == libc::EINTR => {
+                self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
+                // Notify that this KVM_RUN was interrupted.
+                Ok(VcpuEmulation::Interrupted)
+            }
+            #[cfg(feature = "gdb")]
+            Ok(VcpuExit::Debug(_)) => {
+                if let Some(gdb_event) = &self.gdb_event {
+                    gdb_event
+                        .send(get_raw_tid(self.kvm_vcpu.index.into()))
+                        .expect("Unable to notify gdb event");
                 }
-                VcpuExit::MmioWrite(addr, data) => {
-                    if let Some(mmio_bus) = &self.kvm_vcpu.mmio_bus {
-                        mmio_bus.write(addr, data);
-                        METRICS.vcpu.exit_mmio_write.inc();
-                    }
-                    Ok(VcpuEmulation::Handled)
+
+                Ok(VcpuEmulation::Paused)
+            }
+            emulation_result => handle_kvm_exit(&mut self.kvm_vcpu.peripherals, emulation_result),
+        }
+    }
+}
+
+/// Handle the return value of a call to [`VcpuFd::run`] and update our emulation accordingly
+fn handle_kvm_exit(
+    peripherals: &mut Peripherals,
+    emulation_result: Result<VcpuExit, errno::Error>,
+) -> Result<VcpuEmulation, VcpuError> {
+    match emulation_result {
+        Ok(run) => match run {
+            VcpuExit::MmioRead(addr, data) => {
+                if let Some(mmio_bus) = &peripherals.mmio_bus {
+                    let _metric = METRICS.vcpu.exit_mmio_read_agg.record_latency_metrics();
+                    mmio_bus.read(addr, data);
+                    METRICS.vcpu.exit_mmio_read.inc();
                 }
-                VcpuExit::Hlt => {
-                    info!("Received KVM_EXIT_HLT signal");
+                Ok(VcpuEmulation::Handled)
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                if let Some(mmio_bus) = &peripherals.mmio_bus {
+                    let _metric = METRICS.vcpu.exit_mmio_write_agg.record_latency_metrics();
+                    mmio_bus.write(addr, data);
+                    METRICS.vcpu.exit_mmio_write.inc();
+                }
+                Ok(VcpuEmulation::Handled)
+            }
+            VcpuExit::Hlt => {
+                info!("Received KVM_EXIT_HLT signal");
+                Ok(VcpuEmulation::Stopped)
+            }
+            VcpuExit::Shutdown => {
+                info!("Received KVM_EXIT_SHUTDOWN signal");
+                Ok(VcpuEmulation::Stopped)
+            }
+            // Documentation specifies that below kvm exits are considered
+            // errors.
+            VcpuExit::FailEntry(hardware_entry_failure_reason, cpu) => {
+                // Hardware entry failure.
+                METRICS.vcpu.failures.inc();
+                error!(
+                    "Received KVM_EXIT_FAIL_ENTRY signal: {} on cpu {}",
+                    hardware_entry_failure_reason, cpu
+                );
+                Err(VcpuError::FaultyKvmExit(format!(
+                    "{:?}",
+                    VcpuExit::FailEntry(hardware_entry_failure_reason, cpu)
+                )))
+            }
+            VcpuExit::InternalError => {
+                // Failure from the Linux KVM subsystem rather than from the hardware.
+                METRICS.vcpu.failures.inc();
+                error!("Received KVM_EXIT_INTERNAL_ERROR signal");
+                Err(VcpuError::FaultyKvmExit(format!(
+                    "{:?}",
+                    VcpuExit::InternalError
+                )))
+            }
+            VcpuExit::SystemEvent(event_type, event_flags) => match event_type {
+                KVM_SYSTEM_EVENT_RESET | KVM_SYSTEM_EVENT_SHUTDOWN => {
+                    info!(
+                        "Received KVM_SYSTEM_EVENT: type: {}, event: {:?}",
+                        event_type, event_flags
+                    );
                     Ok(VcpuEmulation::Stopped)
                 }
-                VcpuExit::Shutdown => {
-                    info!("Received KVM_EXIT_SHUTDOWN signal");
-                    Ok(VcpuEmulation::Stopped)
-                }
-                // Documentation specifies that below kvm exits are considered
-                // errors.
-                VcpuExit::FailEntry(hardware_entry_failure_reason, cpu) => {
-                    // Hardware entry failure.
+                _ => {
                     METRICS.vcpu.failures.inc();
                     error!(
-                        "Received KVM_EXIT_FAIL_ENTRY signal: {} on cpu {}",
-                        hardware_entry_failure_reason, cpu
+                        "Received KVM_SYSTEM_EVENT signal type: {}, flag: {:?}",
+                        event_type, event_flags
                     );
-                    Err(Error::FaultyKvmExit(format!(
+                    Err(VcpuError::FaultyKvmExit(format!(
                         "{:?}",
-                        VcpuExit::FailEntry(hardware_entry_failure_reason, cpu)
+                        VcpuExit::SystemEvent(event_type, event_flags)
                     )))
-                }
-                VcpuExit::InternalError => {
-                    // Failure from the Linux KVM subsystem rather than from the hardware.
-                    METRICS.vcpu.failures.inc();
-                    error!("Received KVM_EXIT_INTERNAL_ERROR signal");
-                    Err(Error::FaultyKvmExit(format!(
-                        "{:?}",
-                        VcpuExit::InternalError
-                    )))
-                }
-                VcpuExit::SystemEvent(event_type, event_flags) => match event_type {
-                    KVM_SYSTEM_EVENT_RESET | KVM_SYSTEM_EVENT_SHUTDOWN => {
-                        info!(
-                            "Received KVM_SYSTEM_EVENT: type: {}, event: {}",
-                            event_type, event_flags
-                        );
-                        Ok(VcpuEmulation::Stopped)
-                    }
-                    _ => {
-                        METRICS.vcpu.failures.inc();
-                        error!(
-                            "Received KVM_SYSTEM_EVENT signal type: {}, flag: {}",
-                            event_type, event_flags
-                        );
-                        Err(Error::FaultyKvmExit(format!(
-                            "{:?}",
-                            VcpuExit::SystemEvent(event_type, event_flags)
-                        )))
-                    }
-                },
-                arch_specific_reason => {
-                    // run specific architecture emulation.
-                    self.kvm_vcpu.run_arch_emulation(arch_specific_reason)
                 }
             },
-            // The unwrap on raw_os_error can only fail if we have a logic
-            // error in our code in which case it is better to panic.
-            Err(ref err) => {
-                match err.errno() {
-                    libc::EAGAIN => Ok(VcpuEmulation::Handled),
-                    libc::EINTR => {
-                        self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
-                        // Notify that this KVM_RUN was interrupted.
-                        Ok(VcpuEmulation::Interrupted)
-                    }
-                    libc::ENOSYS => {
-                        METRICS.vcpu.failures.inc();
-                        error!(
-                            "Received ENOSYS error because KVM failed to emulate an instruction."
-                        );
-                        Err(Error::FaultyKvmExit(
-                            "Received ENOSYS error because KVM failed to emulate an instruction."
-                                .to_string(),
-                        ))
-                    }
-                    _ => {
-                        METRICS.vcpu.failures.inc();
-                        error!("Failure during vcpu run: {}", err);
-                        Err(Error::FaultyKvmExit(format!("{}", err)))
-                    }
-                }
+            arch_specific_reason => {
+                // run specific architecture emulation.
+                peripherals.run_arch_emulation(arch_specific_reason)
             }
-        }
+        },
+        // The unwrap on raw_os_error can only fail if we have a logic
+        // error in our code in which case it is better to panic.
+        Err(ref err) => match err.errno() {
+            libc::EAGAIN => Ok(VcpuEmulation::Handled),
+            libc::ENOSYS => {
+                METRICS.vcpu.failures.inc();
+                error!("Received ENOSYS error because KVM failed to emulate an instruction.");
+                Err(VcpuError::FaultyKvmExit(
+                    "Received ENOSYS error because KVM failed to emulate an instruction."
+                        .to_string(),
+                ))
+            }
+            _ => {
+                METRICS.vcpu.failures.inc();
+                error!("Failure during vcpu run: {}", err);
+                Err(VcpuError::FaultyKvmExit(format!("{}", err)))
+            }
+        },
     }
 }
 
@@ -555,8 +624,8 @@ impl Drop for Vcpu {
     }
 }
 
-#[derive(Clone)]
 /// List of events that the Vcpu can receive.
+#[derive(Debug, Clone)]
 pub enum VcpuEvent {
     /// The vCPU thread will end when receiving this message.
     Finish,
@@ -564,16 +633,16 @@ pub enum VcpuEvent {
     Pause,
     /// Event to resume the Vcpu.
     Resume,
-    /// Event to restore the state of a paused Vcpu.
-    RestoreState(Box<VcpuState>),
     /// Event to save the state of a paused Vcpu.
     SaveState,
+    /// Event to dump CPU configuration of a paused Vcpu.
+    DumpCpuConfig,
 }
 
 /// List of responses that the Vcpu reports.
 pub enum VcpuResponse {
     /// Requested action encountered an error.
-    Error(Error),
+    Error(VcpuError),
     /// Vcpu is stopped.
     Exited(FcExitCode),
     /// Requested action not allowed.
@@ -582,10 +651,10 @@ pub enum VcpuResponse {
     Paused,
     /// Vcpu is resumed.
     Resumed,
-    /// Vcpu state is restored.
-    RestoredState,
     /// Vcpu state is saved.
     SavedState(Box<VcpuState>),
+    /// Vcpu is in the state where CPU config is dumped.
+    DumpedCpuConfig(Box<CpuConfiguration>),
 }
 
 impl fmt::Debug for VcpuResponse {
@@ -595,15 +664,16 @@ impl fmt::Debug for VcpuResponse {
             Paused => write!(f, "VcpuResponse::Paused"),
             Resumed => write!(f, "VcpuResponse::Resumed"),
             Exited(code) => write!(f, "VcpuResponse::Exited({:?})", code),
-            RestoredState => write!(f, "VcpuResponse::RestoredState"),
             SavedState(_) => write!(f, "VcpuResponse::SavedState"),
             Error(ref err) => write!(f, "VcpuResponse::Error({:?})", err),
             NotAllowed(ref reason) => write!(f, "VcpuResponse::NotAllowed({})", reason),
+            DumpedCpuConfig(_) => write!(f, "VcpuResponse::DumpedCpuConfig"),
         }
     }
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
+#[derive(Debug)]
 pub struct VcpuHandle {
     event_sender: Sender<VcpuEvent>,
     response_receiver: Receiver<VcpuResponse>,
@@ -613,14 +683,9 @@ pub struct VcpuHandle {
 }
 
 /// Error type for [`VcpuHandle::send_event`].
-#[derive(Debug, derive_more::From)]
-pub struct VcpuSendEventError(pub utils::errno::Error);
-impl std::error::Error for VcpuSendEventError {}
-impl fmt::Display for VcpuSendEventError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Failed to signal vCPU: {}", self.0)
-    }
-}
+#[derive(Debug, derive_more::From, thiserror::Error)]
+#[error("Failed to signal vCPU: {0}")]
+pub struct VcpuSendEventError(pub vmm_sys_util::errno::Error);
 
 impl VcpuHandle {
     /// Creates a new [`VcpuHandle`].
@@ -645,7 +710,7 @@ impl VcpuHandle {
     /// # Errors
     ///
     /// When [`vmm_sys_util::linux::signal::Killable::kill`] errors.
-    pub fn send_event(&self, event: VcpuEvent) -> std::result::Result<(), VcpuSendEventError> {
+    pub fn send_event(&self, event: VcpuEvent) -> Result<(), VcpuSendEventError> {
         // Use expect() to crash if the other thread closed this channel.
         self.event_sender
             .send(event)
@@ -679,60 +744,56 @@ impl Drop for VcpuHandle {
     }
 }
 
+/// Vcpu emulation state.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum VcpuEmulation {
+    /// Handled.
     Handled,
+    /// Interrupted.
     Interrupted,
+    /// Stopped.
     Stopped,
+    /// Pause request
+    #[cfg(feature = "gdb")]
+    Paused,
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
+
+    #[cfg(target_arch = "x86_64")]
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Barrier, Mutex};
 
     use linux_loader::loader::KernelLoader;
-    use utils::errno;
-    use utils::signal::validate_signal_num;
-    use utils::vm_memory::{GuestAddress, GuestMemoryMmap};
+    use vmm_sys_util::errno;
 
     use super::*;
     use crate::builder::StartMicrovmError;
-    use crate::seccomp_filters::{get_filters, SeccompConfig};
-    use crate::vstate::vcpu::Error as EmulationError;
+    use crate::devices::bus::DummyDevice;
+    use crate::devices::BusDevice;
+    use crate::seccomp_filters::get_empty_filters;
+    use crate::utils::signal::validate_signal_num;
+    use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
+    use crate::vstate::vcpu::VcpuError as EmulationError;
     use crate::vstate::vm::tests::setup_vm;
     use crate::vstate::vm::Vm;
     use crate::RECV_TIMEOUT_SEC;
 
-    struct DummyDevice;
-    impl devices::BusDevice for DummyDevice {}
-
-    impl Vcpu {
-        pub fn emulate(&self) -> std::result::Result<VcpuExit, errno::Error> {
-            self.test_vcpu_exit_reason
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap_or_else(|| Err(errno::Error::new(libc::SIGILL)))
-        }
-    }
-
     #[test]
-    fn test_run_emulation() {
+    fn test_handle_kvm_exit() {
         let (_vm, mut vcpu, _vm_mem) = setup_vcpu(0x1000);
-        vcpu.test_vcpu_exit_reason = Mutex::new(Some(Ok(VcpuExit::Hlt)));
-        let res = vcpu.run_emulation();
-        assert!(res.is_ok());
+        let res = handle_kvm_exit(&mut vcpu.kvm_vcpu.peripherals, Ok(VcpuExit::Hlt));
         assert_eq!(res.unwrap(), VcpuEmulation::Stopped);
 
-        *(vcpu.test_vcpu_exit_reason.lock().unwrap()) = Some(Ok(VcpuExit::Shutdown));
-        let res = vcpu.run_emulation();
-        assert!(res.is_ok());
+        let res = handle_kvm_exit(&mut vcpu.kvm_vcpu.peripherals, Ok(VcpuExit::Shutdown));
         assert_eq!(res.unwrap(), VcpuEmulation::Stopped);
 
-        *(vcpu.test_vcpu_exit_reason.lock().unwrap()) = Some(Ok(VcpuExit::FailEntry(0, 0)));
-        let res = vcpu.run_emulation();
-        assert!(res.is_err());
+        let res = handle_kvm_exit(
+            &mut vcpu.kvm_vcpu.peripherals,
+            Ok(VcpuExit::FailEntry(0, 0)),
+        );
         assert_eq!(
             format!("{:?}", res.unwrap_err()),
             format!(
@@ -741,9 +802,7 @@ mod tests {
             )
         );
 
-        *(vcpu.test_vcpu_exit_reason.lock().unwrap()) = Some(Ok(VcpuExit::InternalError));
-        let res = vcpu.run_emulation();
-        assert!(res.is_err());
+        let res = handle_kvm_exit(&mut vcpu.kvm_vcpu.peripherals, Ok(VcpuExit::InternalError));
         assert_eq!(
             format!("{:?}", res.unwrap_err()),
             format!(
@@ -752,44 +811,47 @@ mod tests {
             )
         );
 
-        *(vcpu.test_vcpu_exit_reason.lock().unwrap()) = Some(Ok(VcpuExit::SystemEvent(2, 0)));
-        let res = vcpu.run_emulation();
-        assert!(res.is_ok());
+        let res = handle_kvm_exit(
+            &mut vcpu.kvm_vcpu.peripherals,
+            Ok(VcpuExit::SystemEvent(2, &[])),
+        );
         assert_eq!(res.unwrap(), VcpuEmulation::Stopped);
 
-        *(vcpu.test_vcpu_exit_reason.lock().unwrap()) = Some(Ok(VcpuExit::SystemEvent(1, 0)));
-        let res = vcpu.run_emulation();
-        assert!(res.is_ok());
+        let res = handle_kvm_exit(
+            &mut vcpu.kvm_vcpu.peripherals,
+            Ok(VcpuExit::SystemEvent(1, &[])),
+        );
         assert_eq!(res.unwrap(), VcpuEmulation::Stopped);
 
-        *(vcpu.test_vcpu_exit_reason.lock().unwrap()) = Some(Ok(VcpuExit::SystemEvent(3, 0)));
-        let res = vcpu.run_emulation();
-        assert!(res.is_err());
+        let res = handle_kvm_exit(
+            &mut vcpu.kvm_vcpu.peripherals,
+            Ok(VcpuExit::SystemEvent(3, &[])),
+        );
         assert_eq!(
             format!("{:?}", res.unwrap_err()),
             format!(
                 "{:?}",
-                EmulationError::FaultyKvmExit("SystemEvent(3, 0)".to_string())
+                EmulationError::FaultyKvmExit("SystemEvent(3, [])".to_string())
             )
         );
 
         // Check what happens with an unhandled exit reason.
-        *(vcpu.test_vcpu_exit_reason.lock().unwrap()) = Some(Ok(VcpuExit::Unknown));
-        let res = vcpu.run_emulation();
-        assert!(res.is_err());
+        let res = handle_kvm_exit(&mut vcpu.kvm_vcpu.peripherals, Ok(VcpuExit::Unknown));
         assert_eq!(
-            res.err().unwrap().to_string(),
+            res.unwrap_err().to_string(),
             "Unexpected kvm exit received: Unknown".to_string()
         );
 
-        *(vcpu.test_vcpu_exit_reason.lock().unwrap()) = Some(Err(errno::Error::new(libc::EAGAIN)));
-        let res = vcpu.run_emulation();
-        assert!(res.is_ok());
+        let res = handle_kvm_exit(
+            &mut vcpu.kvm_vcpu.peripherals,
+            Err(errno::Error::new(libc::EAGAIN)),
+        );
         assert_eq!(res.unwrap(), VcpuEmulation::Handled);
 
-        *(vcpu.test_vcpu_exit_reason.lock().unwrap()) = Some(Err(errno::Error::new(libc::ENOSYS)));
-        let res = vcpu.run_emulation();
-        assert!(res.is_err());
+        let res = handle_kvm_exit(
+            &mut vcpu.kvm_vcpu.peripherals,
+            Err(errno::Error::new(libc::ENOSYS)),
+        );
         assert_eq!(
             format!("{:?}", res.unwrap_err()),
             format!(
@@ -801,14 +863,10 @@ mod tests {
             )
         );
 
-        *(vcpu.test_vcpu_exit_reason.lock().unwrap()) = Some(Err(errno::Error::new(libc::EINTR)));
-        let res = vcpu.run_emulation();
-        assert!(res.is_ok());
-        assert_eq!(res.unwrap(), VcpuEmulation::Interrupted);
-
-        *(vcpu.test_vcpu_exit_reason.lock().unwrap()) = Some(Err(errno::Error::new(libc::EINVAL)));
-        let res = vcpu.run_emulation();
-        assert!(res.is_err());
+        let res = handle_kvm_exit(
+            &mut vcpu.kvm_vcpu.peripherals,
+            Err(errno::Error::new(libc::EINVAL)),
+        );
         assert_eq!(
             format!("{:?}", res.unwrap_err()),
             format!(
@@ -817,27 +875,22 @@ mod tests {
             )
         );
 
-        let mut bus = devices::Bus::new();
-        let dummy = Arc::new(Mutex::new(DummyDevice));
+        let mut bus = crate::devices::Bus::new();
+        let dummy = Arc::new(Mutex::new(BusDevice::Dummy(DummyDevice)));
         bus.insert(dummy, 0x10, 0x10).unwrap();
         vcpu.set_mmio_bus(bus);
         let addr = 0x10;
-        static mut DATA: [u8; 4] = [0, 0, 0, 0];
 
-        unsafe {
-            *(vcpu.test_vcpu_exit_reason.lock().unwrap()) =
-                Some(Ok(VcpuExit::MmioRead(addr, &mut DATA)));
-        }
-        let res = vcpu.run_emulation();
-        assert!(res.is_ok());
+        let res = handle_kvm_exit(
+            &mut vcpu.kvm_vcpu.peripherals,
+            Ok(VcpuExit::MmioRead(addr, &mut [0, 0, 0, 0])),
+        );
         assert_eq!(res.unwrap(), VcpuEmulation::Handled);
 
-        unsafe {
-            *(vcpu.test_vcpu_exit_reason.lock().unwrap()) =
-                Some(Ok(VcpuExit::MmioWrite(addr, &DATA)));
-        }
-        let res = vcpu.run_emulation();
-        assert!(res.is_ok());
+        let res = handle_kvm_exit(
+            &mut vcpu.kvm_vcpu.peripherals,
+            Ok(VcpuExit::MmioWrite(addr, &[0, 0, 0, 0])),
+        );
         assert_eq!(res.unwrap(), VcpuEmulation::Handled);
     }
 
@@ -847,14 +900,14 @@ mod tests {
             // Guard match with no wildcard to make sure we catch new enum variants.
             match self {
                 Paused | Resumed | Exited(_) => (),
-                Error(_) | NotAllowed(_) | RestoredState | SavedState(_) => (),
+                Error(_) | NotAllowed(_) | SavedState(_) | DumpedCpuConfig(_) => (),
             };
             match (self, other) {
                 (Paused, Paused) | (Resumed, Resumed) => true,
                 (Exited(code), Exited(other_code)) => code == other_code,
                 (NotAllowed(_), NotAllowed(_))
-                | (RestoredState, RestoredState)
-                | (SavedState(_), SavedState(_)) => true,
+                | (SavedState(_), SavedState(_))
+                | (DumpedCpuConfig(_), DumpedCpuConfig(_)) => true,
                 (Error(ref err), Error(ref other_err)) => {
                     format!("{:?}", err) == format!("{:?}", other_err)
                 }
@@ -869,18 +922,19 @@ mod tests {
         let (mut vm, gm) = setup_vm(mem_size);
 
         let exit_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
-        let vcpu;
+
         #[cfg(target_arch = "aarch64")]
-        {
-            vcpu = Vcpu::new(1, &vm, exit_evt).unwrap();
-            vcpu.kvm_vcpu.init(vm.fd()).unwrap();
+        let vcpu = {
+            let mut vcpu = Vcpu::new(1, &vm, exit_evt).unwrap();
+            vcpu.kvm_vcpu.init(&[]).unwrap();
             vm.setup_irqchip(1).unwrap();
-        }
+            vcpu
+        };
         #[cfg(target_arch = "x86_64")]
-        {
+        let vcpu = {
             vm.setup_irqchip().unwrap();
-            vcpu = Vcpu::new(1, &vm, exit_evt).unwrap();
-        }
+            Vcpu::new(1, &vm, exit_evt).unwrap()
+        };
         (vm, vcpu, gm)
     }
 
@@ -891,9 +945,9 @@ mod tests {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
         #[cfg(target_arch = "x86_64")]
-        path.push("src/utilities/mock_resources/test_elf.bin");
+        path.push("src/test_utils/mock_resources/test_elf.bin");
         #[cfg(target_arch = "aarch64")]
-        path.push("src/utilities/mock_resources/test_pe.bin");
+        path.push("src/test_utils/mock_resources/test_pe.bin");
 
         let mut kernel_file = File::open(path).expect("Cannot open kernel file");
 
@@ -912,7 +966,7 @@ mod tests {
         entry_addr.unwrap().kernel_load
     }
 
-    fn vcpu_configured_for_boot() -> (VcpuHandle, utils::eventfd::EventFd) {
+    fn vcpu_configured_for_boot() -> (VcpuHandle, vmm_sys_util::eventfd::EventFd) {
         Vcpu::register_kick_signal_handler();
         // Need enough mem to boot linux.
         let mem_size = 64 << 20;
@@ -923,28 +977,39 @@ mod tests {
         // Needs a kernel since we'll actually run this vcpu.
         let entry_addr = load_good_kernel(&vm_mem);
 
-        #[cfg(target_arch = "aarch64")]
-        vcpu.kvm_vcpu
-            .configure(&vm_mem, entry_addr)
-            .expect("failed to configure vcpu");
         #[cfg(target_arch = "x86_64")]
         {
-            let vcpu_config = VcpuConfig {
-                vcpu_count: 1,
-                smt: false,
-                cpu_template: CpuFeaturesTemplate::None,
-            };
+            use crate::cpu_config::x86_64::cpuid::Cpuid;
             vcpu.kvm_vcpu
                 .configure(
                     &vm_mem,
                     entry_addr,
-                    &vcpu_config,
-                    _vm.supported_cpuid().clone(),
+                    &VcpuConfig {
+                        vcpu_count: 1,
+                        smt: false,
+                        cpu_config: CpuConfiguration {
+                            cpuid: Cpuid::try_from(_vm.supported_cpuid().clone()).unwrap(),
+                            msrs: BTreeMap::new(),
+                        },
+                    },
                 )
                 .expect("failed to configure vcpu");
         }
 
-        let mut seccomp_filters = get_filters(SeccompConfig::None).unwrap();
+        #[cfg(target_arch = "aarch64")]
+        vcpu.kvm_vcpu
+            .configure(
+                &vm_mem,
+                entry_addr,
+                &VcpuConfig {
+                    vcpu_count: 1,
+                    smt: false,
+                    cpu_config: crate::cpu_config::aarch64::CpuConfiguration::default(),
+                },
+            )
+            .expect("failed to configure vcpu");
+
+        let mut seccomp_filters = get_empty_filters();
         let barrier = Arc::new(Barrier::new(2));
         let vcpu_handle = vcpu
             .start_threaded(seccomp_filters.remove("vcpu").unwrap(), barrier.clone())
@@ -958,9 +1023,9 @@ mod tests {
     #[test]
     fn test_set_mmio_bus() {
         let (_, mut vcpu, _) = setup_vcpu(0x1000);
-        assert!(vcpu.kvm_vcpu.mmio_bus.is_none());
-        vcpu.set_mmio_bus(devices::Bus::new());
-        assert!(vcpu.kvm_vcpu.mmio_bus.is_some());
+        assert!(vcpu.kvm_vcpu.peripherals.mmio_bus.is_none());
+        vcpu.set_mmio_bus(crate::devices::Bus::new());
+        assert!(vcpu.kvm_vcpu.peripherals.mmio_bus.is_some());
     }
 
     #[test]
@@ -969,7 +1034,7 @@ mod tests {
 
         // Running on the TLS vcpu should fail before we actually initialize it.
         unsafe {
-            assert!(Vcpu::run_on_thread_local(|_| ()).is_err());
+            Vcpu::run_on_thread_local(|_| ()).unwrap_err();
         }
 
         // Initialize vcpu TLS.
@@ -979,19 +1044,19 @@ mod tests {
         // the one in TLS.
         vcpu.kvm_vcpu.index = 12;
         unsafe {
-            assert!(Vcpu::run_on_thread_local(|v| assert_eq!(v.kvm_vcpu.index, 12)).is_ok());
+            Vcpu::run_on_thread_local(|v| assert_eq!(v.kvm_vcpu.index, 12)).unwrap();
         }
 
         // Reset vcpu TLS.
-        assert!(vcpu.reset_thread_local_data().is_ok());
+        vcpu.reset_thread_local_data().unwrap();
 
         // Running on the TLS vcpu after TLS reset should fail.
         unsafe {
-            assert!(Vcpu::run_on_thread_local(|_| ()).is_err());
+            Vcpu::run_on_thread_local(|_| ()).unwrap_err();
         }
 
         // Second reset should return error.
-        assert!(vcpu.reset_thread_local_data().is_err());
+        vcpu.reset_thread_local_data().unwrap_err();
     }
 
     #[test]
@@ -1008,7 +1073,7 @@ mod tests {
         Vcpu::register_kick_signal_handler();
         let (vm, mut vcpu, _) = setup_vcpu(0x1000);
 
-        let kvm_run =
+        let mut kvm_run =
             kvm_ioctls::KvmRunWrapper::mmap_from_fd(&vcpu.kvm_vcpu.fd, vm.fd().run_size())
                 .expect("cannot mmap kvm-run");
         let success = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1060,6 +1125,31 @@ mod tests {
     }
 
     #[test]
+    fn test_immediate_exit_shortcircuits_execution() {
+        let (_vm, mut vcpu, _) = setup_vcpu(0x1000);
+
+        vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(1);
+        // Set a dummy value to be returned by the emulate call
+        let result = vcpu.run_emulation().expect("Failed to run emulation");
+        assert_eq!(
+            result,
+            VcpuEmulation::Interrupted,
+            "The Immediate Exit short-circuit should have prevented the execution of emulate"
+        );
+
+        let event_sender = vcpu.event_sender.take().expect("vCPU already started");
+        let _ = event_sender.send(VcpuEvent::Resume);
+        vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(1);
+        // paused is expected to coerce immediate_exit to 0 when receiving a VcpuEvent::Resume
+        let _ = vcpu.paused();
+        assert_eq!(
+            0,
+            vcpu.kvm_vcpu.fd.get_kvm_run().immediate_exit,
+            "Immediate Exit should have been disabled by sending Resume to a paused VM"
+        )
+    }
+
+    #[test]
     fn test_vcpu_pause_resume() {
         let (vcpu_handle, vcpu_exit_evt) = vcpu_configured_for_boot();
 
@@ -1092,7 +1182,7 @@ mod tests {
     }
 
     #[test]
-    fn test_vcpu_save_restore_state_events() {
+    fn test_vcpu_save_state_events() {
         let (vcpu_handle, _vcpu_exit_evt) = vcpu_configured_for_boot();
 
         // Queue a Resume event, expect a response.
@@ -1112,20 +1202,45 @@ mod tests {
         vcpu_handle
             .send_event(VcpuEvent::SaveState)
             .expect("failed to send event to vcpu");
-        let vcpu_state = match vcpu_handle
+        match vcpu_handle
             .response_receiver()
             .recv_timeout(RECV_TIMEOUT_SEC)
             .expect("did not receive event response from vcpu")
         {
-            VcpuResponse::SavedState(state) => state,
+            VcpuResponse::SavedState(_) => {}
             _ => panic!("unexpected response"),
         };
 
-        // Queue a RestoreState event, expect success.
+        vcpu_handle.send_event(VcpuEvent::Finish).unwrap();
+    }
+
+    #[test]
+    fn test_vcpu_dump_cpu_config() {
+        let (vcpu_handle, _) = vcpu_configured_for_boot();
+
+        // Queue a DumpCpuConfig event, expect a DumpedCpuConfig response.
+        vcpu_handle
+            .send_event(VcpuEvent::DumpCpuConfig)
+            .expect("Failed to send an event to vcpu.");
+        match vcpu_handle
+            .response_receiver()
+            .recv_timeout(RECV_TIMEOUT_SEC)
+            .expect("Could not receive a response from vcpu.")
+        {
+            VcpuResponse::DumpedCpuConfig(_) => (),
+            VcpuResponse::Error(err) => panic!("Got an error: {err}"),
+            _ => panic!("Got an unexpected response."),
+        }
+
+        // Queue a Resume event, expect a response.
+        queue_event_expect_response(&vcpu_handle, VcpuEvent::Resume, VcpuResponse::Resumed);
+
+        // Queue a DumpCpuConfig event, expect a NotAllowed respoonse.
+        // The DumpCpuConfig event is only allowed while paused.
         queue_event_expect_response(
             &vcpu_handle,
-            VcpuEvent::RestoreState(vcpu_state),
-            VcpuResponse::RestoredState,
+            VcpuEvent::DumpCpuConfig,
+            VcpuResponse::NotAllowed(String::new()),
         );
 
         vcpu_handle.send_event(VcpuEvent::Finish).unwrap();
@@ -1133,6 +1248,6 @@ mod tests {
 
     #[test]
     fn test_vcpu_rtsig_offset() {
-        assert!(validate_signal_num(sigrtmin() + VCPU_RTSIG_OFFSET).is_ok());
+        validate_signal_num(sigrtmin() + VCPU_RTSIG_OFFSET).unwrap();
     }
 }

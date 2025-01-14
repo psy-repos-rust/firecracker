@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests on devices config space."""
 
-import os
 import platform
 import random
 import re
@@ -10,57 +9,40 @@ import string
 import subprocess
 from threading import Thread
 
-import host_tools.logging as log_tools
 import host_tools.network as net_tools  # pylint: disable=import-error
 
 # pylint: disable=global-statement
 PAYLOAD_DATA_SIZE = 20
 
 
-def test_net_change_mac_address(
-    test_microvm_with_api, network_config, change_net_config_space_bin
-):
+def test_net_change_mac_address(uvm_plain_any, change_net_config_space_bin):
     """
     Test changing the MAC address of the network device.
-
-    @type: functional
     """
-    test_microvm = test_microvm_with_api
+
+    test_microvm = uvm_plain_any
+    test_microvm.help.enable_console()
     test_microvm.spawn()
     test_microvm.basic_config(boot_args="ipv6.disable=1")
 
     # Data exchange interface ('eth0' in guest).
-    iface_id = "1"
-    _tap1, host_ip1, guest_ip1 = test_microvm.ssh_network_config(
-        network_config, iface_id
-    )
-
+    test_microvm.add_net_iface()
     # Control interface ('eth1' in guest).
-    iface_id = "2"
-    _tap2, _, guest_ip2 = test_microvm.ssh_network_config(network_config, iface_id)
-
-    # Configure metrics, to get later the `tx_spoofed_mac_count`.
-    metrics_fifo_path = os.path.join(test_microvm.path, "metrics_fifo")
-    metrics_fifo = log_tools.Fifo(metrics_fifo_path)
-    response = test_microvm.metrics.put(
-        metrics_path=test_microvm.create_jailed_resource(metrics_fifo.path)
-    )
-    assert test_microvm.api_session.is_status_no_content(response.status_code)
-
+    test_microvm.add_net_iface()
     test_microvm.start()
 
     # Create the control ssh connection.
-    test_microvm.ssh_config["hostname"] = guest_ip2
+    ssh_conn = test_microvm.ssh_iface(1)
+    host_ip0 = test_microvm.iface["eth0"]["iface"].host_ip
+    guest_ip0 = test_microvm.iface["eth0"]["iface"].guest_ip
 
     # Start a server(host) - client(guest) communication with the following
     # parameters.
     host_port = 4444
     iterations = 1
-    _exchange_data(
-        test_microvm.jailer, test_microvm.ssh, host_ip1, host_port, iterations
-    )
+    _exchange_data(test_microvm.jailer, ssh_conn, host_ip0, host_port, iterations)
 
-    fc_metrics = test_microvm.flush_metrics(metrics_fifo)
+    fc_metrics = test_microvm.flush_metrics()
     assert fc_metrics["net"]["tx_spoofed_mac_count"] == 0
 
     # Change the MAC address of the network data interface.
@@ -69,20 +51,18 @@ def test_net_change_mac_address(
     # on the network interface.
     mac = "06:05:04:03:02:01"
     mac_hex = "0x060504030201"
-    guest_if1_name = net_tools.get_guest_net_if_name(test_microvm.ssh, guest_ip1)
+    guest_if1_name = net_tools.get_guest_net_if_name(ssh_conn, guest_ip0)
     assert guest_if1_name is not None
-    _change_guest_if_mac(test_microvm.ssh, mac, guest_if1_name)
+    _change_guest_if_mac(ssh_conn, mac, guest_if1_name)
 
-    _exchange_data(
-        test_microvm.jailer, test_microvm.ssh, host_ip1, host_port, iterations
-    )
+    _exchange_data(test_microvm.jailer, ssh_conn, host_ip0, host_port, iterations)
 
     # `tx_spoofed_mac_count` metric was incremented due to the MAC address
     # change.
-    fc_metrics = test_microvm.flush_metrics(metrics_fifo)
+    fc_metrics = test_microvm.flush_metrics()
     assert fc_metrics["net"]["tx_spoofed_mac_count"] > 0
 
-    net_addr_base = _get_net_mem_addr_base(test_microvm.ssh, guest_if1_name)
+    net_addr_base = _get_net_mem_addr_base(ssh_conn, guest_if1_name)
     assert net_addr_base is not None
 
     # Write into '/dev/mem' the same mac address, byte by byte.
@@ -90,33 +70,26 @@ def test_net_change_mac_address(
     # After this step, the net device kernel struct MAC address will be the
     # same with the MAC address stored in the network device registers. The
     # `tx_spoofed_mac_count` metric shouldn't be incremented later on.
-    test_microvm.ssh.scp_file(change_net_config_space_bin, "change_net_config_space")
-    cmd = "chmod u+x change_net_config_space &&\
-          ./change_net_config_space {} {}"
-    cmd = cmd.format(net_addr_base, mac_hex)
+    rmt_path = "/tmp/change_net_config_space"
+    test_microvm.ssh.scp_put(change_net_config_space_bin, rmt_path)
+    cmd = f"chmod u+x {rmt_path} && {rmt_path} {net_addr_base} {mac_hex}"
 
     # This should be executed successfully.
-    exit_code, stdout, stderr = test_microvm.ssh.run(cmd)
-    stderr = stderr.read()
-    assert exit_code == 0, stderr
-    assert stdout.read() == mac
+    _, stdout, _ = ssh_conn.check_output(cmd)
+    assert stdout == mac
 
     # Discard any parasite data exchange which might've been
     # happened on the emulation thread while the config space
     # was changed on the vCPU thread.
-    test_microvm.flush_metrics(metrics_fifo)
+    test_microvm.flush_metrics()
 
-    _exchange_data(
-        test_microvm.jailer, test_microvm.ssh, host_ip1, host_port, iterations
-    )
-    fc_metrics = test_microvm.flush_metrics(metrics_fifo)
+    _exchange_data(test_microvm.jailer, ssh_conn, host_ip0, host_port, iterations)
+    fc_metrics = test_microvm.flush_metrics()
     assert fc_metrics["net"]["tx_spoofed_mac_count"] == 0
 
     # Try again, just to be extra sure.
-    _exchange_data(
-        test_microvm.jailer, test_microvm.ssh, host_ip1, host_port, iterations
-    )
-    fc_metrics = test_microvm.flush_metrics(metrics_fifo)
+    _exchange_data(test_microvm.jailer, ssh_conn, host_ip0, host_port, iterations)
+    fc_metrics = test_microvm.flush_metrics()
     assert fc_metrics["net"]["tx_spoofed_mac_count"] == 0
 
 
@@ -148,7 +121,7 @@ def _create_server(jailer, host_ip, port, iterations):
     cmd = 'python3 -c "{}"'.format(
         script.format(host_ip, port, iterations, PAYLOAD_DATA_SIZE)
     )
-    netns_cmd = jailer.netns_cmd_prefix() + cmd
+    netns_cmd = jailer.netns.cmd_prefix() + " " + cmd
     exit_code = subprocess.call(netns_cmd, shell=True)
     assert exit_code == 0
 
@@ -175,16 +148,14 @@ def _send_data_g2h(ssh_connection, host_ip, host_port, iterations, data, retries
         "s.close()"
     )
 
-    # The guest has Python2
-    cmd = 'python -c "{}"'.format(
+    # The guest has Python3
+    cmd = 'python3 -c "{}"'.format(
         script.format(retries, host_ip, str(host_port), iterations, data)
     )
 
     # Wait server to initialize.
-    exit_code, _, stderr = ssh_connection.execute_command(cmd)
+    _, _, stderr = ssh_connection.check_output(cmd)
     # If this assert fails, a connection refused happened.
-    stderr = stderr.read()
-    assert exit_code == 0, stderr
     assert stderr == ""
 
 
@@ -221,48 +192,117 @@ def _change_guest_if_mac(ssh_connection, guest_if_mac, guest_if_name):
     cmd = "ip link set dev {} address ".format(guest_if_name) + guest_if_mac
     # The connection will be down, because changing the mac will issue down/up
     # on the interface.
-    ssh_connection.execute_command(cmd)
+    ssh_connection.run(cmd)
+
+
+def _find_iomem_range(ssh_connection, dev_name):
+    # `/proc/iomem` includes information of the system's MMIO registered
+    # slots. It looks like this:
+    #
+    # ```
+    # ~ cat /proc/iomem
+    # 00000000-00000fff : Reserved
+    # 00001000-0007ffff : System RAM
+    # 00080000-0009ffff : Reserved
+    # 000f0000-000fffff : System ROM
+    # 00100000-0fffffff : System RAM
+    #   01000000-018031d0 : Kernel code
+    #   018031d1-01c863bf : Kernel data
+    #   01df8000-0209ffff : Kernel bss
+    # d0000000-d0000fff : LNRO0005:00
+    #   d0000000-d0000fff : LNRO0005:00
+    # d0001000-d0001fff : LNRO0005:01
+    #   d0001000-d0001fff : LNRO0005:01
+    # ```
+    #
+    # So, to find the address range of a device we just `cat`
+    # its contents and grep for the VirtIO device name, which
+    # with ACPI is "LNRO0005:XY".
+    cmd = f"cat /proc/iomem | grep -m 1 {dev_name}"
+    rc, stdout, stderr = ssh_connection.run(cmd)
+    assert rc == 0, stderr
+
+    # Take range in the form 'start-end' from line. The line looks like this:
+    # d00002000-d0002fff : LNRO0005:02
+    mem_range = stdout.strip().split(" ")[0]
+
+    # Parse range into (start, end) integers
+    tokens = mem_range.split("-")
+    return (int(tokens[0], 16), int(tokens[1], 16))
+
+
+def _get_net_mem_addr_base_x86_acpi(ssh_connection, if_name):
+    """Check for net device memory start address via ACPI info"""
+    # On x86 we define VirtIO devices through ACPI AML bytecode. VirtIO devices
+    # are identified as "LNRO0005" and appear under /sys/devices/platform
+    sys_virtio_mmio_cmdline = "/sys/devices/platform/"
+    cmd = "ls {}"
+    _, stdout, _ = ssh_connection.check_output(cmd.format(sys_virtio_mmio_cmdline))
+    virtio_devs = list(filter(lambda x: "LNRO0005" in x, stdout.strip().split()))
+
+    # For virtio-net LNRO0005 devices, we should have a path like:
+    # /sys/devices/platform/LNRO0005::XY/virtioXY/net which is a directory
+    # that includes a subdirectory `ethZ` which represents the network device
+    # that corresponds to the virtio-net device.
+    cmd = "ls {}/{}/virtio{}/net"
+    for idx, dev in enumerate(virtio_devs):
+        _, guest_if_name, _ = ssh_connection.run(
+            cmd.format(sys_virtio_mmio_cmdline, dev, idx)
+        )
+        if guest_if_name.strip() == if_name:
+            return _find_iomem_range(ssh_connection, dev)[0]
+
+    return None
+
+
+def _get_net_mem_addr_base_x86_cmdline(ssh_connection, if_name):
+    """Check for net device memory start address via command line arguments"""
+    sys_virtio_mmio_cmdline = "/sys/devices/virtio-mmio-cmdline/"
+    cmd = "ls {} | grep virtio-mmio. | sed 's/virtio-mmio.//'"
+    exit_code, stdout, stderr = ssh_connection.run(cmd.format(sys_virtio_mmio_cmdline))
+    assert exit_code == 0, stderr
+    virtio_devs_idx = stdout.strip().split()
+
+    cmd = "cat /proc/cmdline"
+    _, cmd_line, _ = ssh_connection.check_output(cmd)
+    pattern_dev = re.compile("(virtio_mmio.device=4K@0x[0-9a-f]+:[0-9]+)+")
+    pattern_addr = re.compile("virtio_mmio.device=4K@(0x[0-9a-f]+):[0-9]+")
+    devs_addr = []
+    for dev in re.findall(pattern_dev, cmd_line):
+        matched_addr = pattern_addr.search(dev)
+        # The 1st group which matches this pattern
+        # is the device start address. `0` group is
+        # full match
+        addr = matched_addr.group(1)
+        devs_addr.append(addr)
+
+    cmd = "ls {}/virtio-mmio.{}/virtio{}/net"
+    for idx in virtio_devs_idx:
+        _, guest_if_name, _ = ssh_connection.run(
+            cmd.format(sys_virtio_mmio_cmdline, idx, idx)
+        )
+        if guest_if_name.strip() == if_name:
+            return devs_addr[int(idx)]
+
+    return None
 
 
 def _get_net_mem_addr_base(ssh_connection, if_name):
     """Get the net device memory start address."""
     if platform.machine() == "x86_64":
-        sys_virtio_mmio_cmdline = "/sys/devices/virtio-mmio-cmdline/"
-        cmd = "ls {} | grep virtio-mmio. | sed 's/virtio-mmio.//'"
-        exit_code, stdout, _ = ssh_connection.execute_command(
-            cmd.format(sys_virtio_mmio_cmdline)
-        )
-        assert exit_code == 0
-        virtio_devs_idx = stdout.read().split()
+        acpi_info = _get_net_mem_addr_base_x86_acpi(ssh_connection, if_name)
+        if acpi_info is not None:
+            return acpi_info
 
-        cmd = "cat /proc/cmdline"
-        exit_code, cmd_line, _ = ssh_connection.execute_command(cmd)
-        assert exit_code == 0
-        pattern_dev = re.compile("(virtio_mmio.device=4K@0x[0-9a-f]+:[0-9]+)+")
-        pattern_addr = re.compile("virtio_mmio.device=4K@(0x[0-9a-f]+):[0-9]+")
-        devs_addr = []
-        for dev in re.findall(pattern_dev, cmd_line.read()):
-            matched_addr = pattern_addr.search(dev)
-            # The 1st group which matches this pattern
-            # is the device start address. `0` group is
-            # full match.
-            addr = matched_addr.group(1)
-            devs_addr.append(addr)
+        return _get_net_mem_addr_base_x86_cmdline(ssh_connection, if_name)
 
-        cmd = "ls {}/virtio-mmio.{}/virtio{}/net"
-        for idx in virtio_devs_idx:
-            _, guest_if_name, _ = ssh_connection.execute_command(
-                cmd.format(sys_virtio_mmio_cmdline, idx, idx)
-            )
-            if guest_if_name.read().strip() == if_name:
-                return devs_addr[int(idx)]
-    elif platform.machine() == "aarch64":
+    if platform.machine() == "aarch64":
         sys_virtio_mmio_cmdline = "/sys/devices/platform"
         cmd = "ls {} | grep .virtio_mmio".format(sys_virtio_mmio_cmdline)
-        rc, stdout, _ = ssh_connection.execute_command(cmd)
+        rc, stdout, _ = ssh_connection.run(cmd)
         assert rc == 0
 
-        virtio_devs = stdout.read().split()
+        virtio_devs = stdout.split()
         devs_addr = list(map(lambda dev: dev.split(".")[0], virtio_devs))
 
         cmd = "ls {}/{}/virtio{}/net"
@@ -270,10 +310,10 @@ def _get_net_mem_addr_base(ssh_connection, if_name):
         # accordingly when parsed inside `change_config_space.c`.
         hex_prefix = "0x"
         for idx, dev in enumerate(virtio_devs):
-            _, guest_if_name, _ = ssh_connection.execute_command(
+            _, guest_if_name, _ = ssh_connection.run(
                 cmd.format(sys_virtio_mmio_cmdline, dev, idx)
             )
-            if guest_if_name.read().strip() == if_name:
+            if guest_if_name.strip() == if_name:
                 return hex_prefix + devs_addr[int(idx)]
 
     return None

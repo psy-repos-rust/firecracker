@@ -1,33 +1,27 @@
 # Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Tests enforcing code coverage for production code."""
+import os
+import warnings
 
 import pytest
 
 from framework import utils
+from framework.properties import global_props
 from host_tools import proc
-
-# We have different coverages based on the host kernel version. This is
-# caused by io_uring, which is only supported by FC for kernels newer
-# than 5.10.
-
-# AMD has a slightly different coverage due to
-# the appearance of the brand string. On Intel,
-# this contains the frequency while on AMD it does not.
-# Checkout the cpuid crate. In the future other
-# differences may appear.
-if utils.is_io_uring_supported():
-    COVERAGE_DICT = {"Intel": 83.19, "AMD": 82.38, "ARM": 82.49}
-else:
-    COVERAGE_DICT = {"Intel": 80.32, "AMD": 79.5, "ARM": 79.44}
-
+from host_tools.cargo_build import cargo
 
 PROC_MODEL = proc.proc_type()
 
 # Toolchain target architecture.
-if ("Intel" in PROC_MODEL) or ("AMD" in PROC_MODEL):
+if "Intel" in PROC_MODEL:
+    VENDOR = "Intel"
+    ARCH = "x86_64"
+elif "AMD" in PROC_MODEL:
+    VENDOR = "AMD"
     ARCH = "x86_64"
 elif "ARM" in PROC_MODEL:
+    VENDOR = "ARM"
     ARCH = "aarch64"
 else:
     raise Exception(f"Unsupported processor model ({PROC_MODEL})")
@@ -38,37 +32,28 @@ else:
 # run coverage with the `gnu` toolchains and run unit tests with the `musl` toolchains.
 TARGET = f"{ARCH}-unknown-linux-gnu"
 
-# We allow coverage to have a max difference of `COVERAGE_MAX_DELTA` as percentage before failing
-# the test (currently 0.05%).
-COVERAGE_MAX_DELTA = 0.05
 
-
-@pytest.mark.timeout(400)
-def test_coverage(monkeypatch, record_property, metrics):
-    """Test code coverage
-
-    @type: build
-    """
-    # Get coverage target.
-    processor_model = [item for item in COVERAGE_DICT if item in PROC_MODEL]
-    assert len(processor_model) == 1, "Could not get processor model!"
-    coverage_target = COVERAGE_DICT[processor_model[0]]
-
+@pytest.mark.timeout(600)
+def test_coverage(monkeypatch):
+    """Test code coverage"""
     # Re-direct to repository root.
     monkeypatch.chdir("..")
 
     # Generate test profiles.
-    utils.run_cmd(
-        f'\
-        RUSTFLAGS="-Cinstrument-coverage" \
-        LLVM_PROFILE_FILE="coverage-%p-%m.profraw" \
-        cargo test --all --target={TARGET} -- --test-threads=1 \
-    '
+    cargo(
+        "test",
+        f"--all --target {TARGET}",
+        "--test-threads=1",
+        env={
+            "RUSTFLAGS": "-Cinstrument-coverage",
+            "LLVM_PROFILE_FILE": "coverage-%p-%m.profraw",
+        },
     )
 
+    lcov_file = "./build/cargo_target/coverage.lcov"
+
     # Generate coverage report.
-    utils.run_cmd(
-        f"""
+    cmd = f"""
         grcov . \
             -s . \
             --binary-path ./build/cargo_target/{TARGET}/debug/ \
@@ -76,34 +61,49 @@ def test_coverage(monkeypatch, record_property, metrics):
             --ignore "build/*" \
             --ignore "**/tests/*" \
             --ignore "**/test_utils*" \
-            -t html \
+            --ignore "**/mock_*" \
+            --ignore "src/firecracker/examples/*" \
+            --ignore "**/gen*" \
+            -t lcov \
             --ignore-not-existing \
-            -o ./build/cargo_target/{TARGET}/debug/coverage"""
-    )
+            -o {lcov_file}"""
 
-    # Extract coverage from html report.
-    #
-    # The line looks like `<abbr title="44724 / 49237">90.83 %</abbr></p>` and is the first
-    # occurrence of the `<abbr>` element in the file.
-    #
-    # When we update grcov to 0.8.* we can update this to pull the coverage from a generated .json
-    # file.
-    index = open(
-        f"./build/cargo_target/{TARGET}/debug/coverage/index.html", encoding="utf-8"
-    )
-    index_contents = index.read()
-    end = index_contents.find(" %</abbr></p>")
-    start = index_contents[:end].rfind(">")
-    coverage_str = index_contents[start + 1 : end]
-    coverage = float(coverage_str)
+    # Ignore code not relevant for the intended platform
+    # - CPUID and CPU template
+    # - Static CPU templates intended for specific CPU vendors
+    if "AMD" == VENDOR:
+        cmd += " \
+            --ignore **/intel* \
+            --ignore *t2* \
+            --ignore *t2s* \
+            --ignore *t2cl* \
+            --ignore *c3* \
+            "
+    elif "Intel" == VENDOR:
+        cmd += " \
+            --ignore **/amd* \
+            --ignore *t2a* \
+            "
 
-    # Record coverage.
-    record_property(
-        "coverage", f"{coverage}% {coverage_target}% ±{COVERAGE_MAX_DELTA:.2f}%"
-    )
-    metrics.set_dimensions({"cpu_arch": ARCH})
-    metrics.put_metric("code_coverage", coverage, unit="Percent")
+    utils.check_output(cmd)
 
-    assert coverage == pytest.approx(
-        coverage_target, abs=COVERAGE_MAX_DELTA
-    ), f"Current code coverage ({coverage:.2f}%) deviates more than {COVERAGE_MAX_DELTA:.2f}% from target ({coverage_target:.2f})"
+    # Only upload if token is present and we're in EC2
+    if "CODECOV_TOKEN" in os.environ and global_props.is_ec2:
+        pr_number = os.environ.get("BUILDKITE_PULL_REQUEST")
+        branch = os.environ.get("BUILDKITE_BRANCH")
+
+        if not branch:
+            branch = utils.check_output("git rev-parse --abbrev-ref HEAD").stdout
+
+        codecov_cmd = f"codecov -f {lcov_file} -F {global_props.host_linux_version}-{global_props.instance}"
+
+        if pr_number and pr_number != "false":
+            codecov_cmd += f" -P {pr_number}"
+        else:
+            codecov_cmd += f" -B {branch}"
+
+        utils.check_output(codecov_cmd)
+    else:
+        warnings.warn(
+            "Not uploading coverage report due to missing CODECOV_TOKEN environment variable"
+        )

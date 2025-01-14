@@ -1,4 +1,8 @@
-![Firecracker Logo Title](docs/images/fc_logo_full_transparent-bg.png)
+<picture>
+   <source media="(prefers-color-scheme: dark)" srcset="docs/images/fc_logo_full_transparent-bg_white-fg.png">
+   <source media="(prefers-color-scheme: light)" srcset="docs/images/fc_logo_full_transparent-bg.png">
+   <img alt="Firecracker Logo Title" width="750" src="docs/images/fc_logo_full_transparent-bg.png">
+</picture>
 
 Our mission is to enable secure, multi-tenant, minimal-overhead execution of
 container and function workloads.
@@ -21,15 +25,15 @@ the Linux Kernel Virtual Machine (KVM) to create and run microVMs. Firecracker
 has a minimalist design. It excludes unnecessary devices and guest-facing
 functionality to reduce the memory footprint and attack surface area of each
 microVM. This improves security, decreases the startup time, and increases
-hardware utilization. Firecracker has also been integrated in container runtimes,
-for example
-[Kata Containers](https://github.com/kata-containers/documentation/wiki/Initial-release-of-Kata-Containers-with-Firecracker-support)
-and [Weaveworks Ignite](https://github.com/weaveworks/ignite).
+hardware utilization. Firecracker has also been integrated in container
+runtimes, for example
+[Kata Containers](https://github.com/kata-containers/kata-containers) and
+[Flintlock](https://github.com/liquidmetal-dev/flintlock).
 
 Firecracker was developed at Amazon Web Services to accelerate the speed and
 efficiency of services like [AWS Lambda](https://aws.amazon.com/lambda/) and
-[AWS Fargate](https://aws.amazon.com/fargate/). Firecracker is open
-sourced under [Apache version 2.0](LICENSE).
+[AWS Fargate](https://aws.amazon.com/fargate/). Firecracker is open sourced
+under [Apache version 2.0](LICENSE).
 
 To read more about Firecracker, check out
 [firecracker-microvm.io](https://firecracker-microvm.github.io).
@@ -40,8 +44,8 @@ To get started with Firecracker, download the latest
 [release](https://github.com/firecracker-microvm/firecracker/releases) binaries
 or build it from source.
 
-You can build Firecracker on any Unix/Linux system that has Docker running
-(we use a development container) and `bash` installed, as follows:
+You can build Firecracker on any Unix/Linux system that has Docker running (we
+use a development container) and `bash` installed, as follows:
 
 ```bash
 git clone https://github.com/firecracker-microvm/firecracker
@@ -88,15 +92,15 @@ Firecracker's overall architecture is described in
 
 Firecracker consists of a single micro Virtual Machine Manager process that
 exposes an API endpoint to the host once started. The API is
-[specified in OpenAPI format](src/api_server/swagger/firecracker.yaml). Read more
-about it in the [API docs](docs/api_requests).
+[specified in OpenAPI format](src/firecracker/swagger/firecracker.yaml). Read
+more about it in the [API docs](docs/api_requests).
 
 The **API endpoint** can be used to:
 
 - Configure the microvm by:
   - Setting the number of vCPUs (the default is 1).
   - Setting the memory size (the default is 128 MiB).
-  - [x86_64 only] Choosing a CPU template (currently, C3, T2 and T2S are available).
+  - Configuring a [CPU template](docs/cpu_templates/cpu-templates.md).
 - Add one or more network interfaces to the microVM.
 - Add one or more read-write or read-only disks to the microVM, each represented
   by a file-backed block device.
@@ -109,6 +113,7 @@ The **API endpoint** can be used to:
 - `[BETA]` Configure the data tree of the guest-facing metadata service. The
   service is only available to the guest if this resource is configured.
 - Add a [vsock socket](docs/vsock.md) to the microVM.
+- Add a [entropy device](docs/entropy.md) to the microVM.
 - Start the microVM using a given kernel image, root file system, and boot
   arguments.
 - [x86_64 only] Stop the microVM.
@@ -118,41 +123,24 @@ The **API endpoint** can be used to:
 - Demand fault paging and CPU oversubscription enabled by default.
 - Advanced, thread-specific seccomp filters for enhanced security.
 - [Jailer](docs/jailer.md) process for starting Firecracker in production
-  scenarios; applies a cgroup/namespace isolation barrier and then
-  drops privileges.
+  scenarios; applies a cgroup/namespace isolation barrier and then drops
+  privileges.
 
-## Supported platforms
+## Tested platforms
 
-We continuously test Firecracker on machines with the following CPUs
-micro-architectures: Intel Skylake, Intel Cascade Lake, Intel Ice Lake, AMD
-Zen 3, ARM64 Neoverse N1 and ARM64 Neoverse V1.
+We test all combinations of:
 
-Firecracker is [generally available](docs/RELEASE_POLICY.md) on Intel x86_64,
-AMD x86_64 and ARM64 CPUs (starting from release v0.24) that offer hardware
-virtualization support, and that are released starting with 2015.
-All production use cases should follow [these production host setup instructions](docs/prod-host-setup.md).
-
-Firecracker may work on other x86 and Arm 64-bit CPUs with support for hardware
-virtualization, but any such platform is currently not supported and not fit
-for production. If you want to run Firecracker on such platforms, please
-[open a feature request](https://github.com/firecracker-microvm/firecracker/issues/new?assignees=&labels=&template=feature_request.md&title=%5BFeature+Request%5D+Title).
-
-Firecracker currently only supports little-endian platforms. Firecracker will
-not compile for big-endian architectures, and will not work correctly with
-big-endian configured guests.
-
-## Supported kernels
-
-For a list of supported host/guest kernels and future kernel related
-plans, check out our [kernel support policy](docs/kernel-policy.md).
+| Instance  | Host OS & Kernel | Guest Rootfs | Guest Kernel |
+| :-------- | :--------------- | :----------- | :----------- |
+| c5n.metal | al2 linux_5.10   | ubuntu 24.04 | linux_5.10   |
+| m5n.metal | al2023 linux_6.1 |              | linux_6.1    |
+| m6i.metal |                  |              |              |
+| m6a.metal |                  |              |              |
+| m6g.metal |                  |              |              |
+| m7g.metal |                  |              |              |
 
 ## Known issues and Limitations
 
-- The [SendCtrlAltDel](docs/api_requests/actions.md#sendctrlaltdel) API request
-  is not supported for aarch64 enabled microVMs.
-- Configuring CPU templates is only supported for Intel enabled microVMs.
-- If a CPU template is not used on x86_64, overwrites of `MSR_IA32_TSX_CTRL` MSR
-  value will not be preserved after restoring from a snapshot.
 - The `pl031` RTC device on aarch64 does not support interrupts, so guest
   programs which use an RTC alarm (e.g. `hwclock`) will not work.
 
@@ -168,8 +156,8 @@ testing.
 
 The security of Firecracker is our top priority. If you suspect you have
 uncovered a vulnerability, contact us privately, as outlined in our
-[security policy document](SECURITY.md); we will immediately prioritize
-your disclosure.
+[security policy document](SECURITY.md); we will immediately prioritize your
+disclosure.
 
 ## FAQ & Contact
 
@@ -179,7 +167,7 @@ You can get in touch with the Firecracker community in the following ways:
 
 - Security-related issues, see our [security policy document](SECURITY.md).
 - Chat with us on our
-  [Slack workspace](https://join.slack.com/t/firecracker-microvm/shared_invite/zt-1fecwrorm-x5URTlOzBR2fExTU2mWfug)
+  [Slack workspace](https://join.slack.com/t/firecracker-microvm/shared_invite/zt-2tc0mfxpc-tU~HYAYSzLDl5XGGJU3YIg)
   _Note: most of the maintainers are on a European time zone._
 - Open a GitHub issue in this repository.
 - Email the maintainers at

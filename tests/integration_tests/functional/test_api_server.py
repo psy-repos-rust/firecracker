@@ -4,10 +4,10 @@
 
 import socket
 
-from framework.utils import run_cmd
+from framework.utils import check_output
 
 
-def test_api_socket_in_use(test_microvm_with_api):
+def test_api_socket_in_use(uvm_plain):
     """
     Test error message when api socket is already in use.
 
@@ -15,16 +15,16 @@ def test_api_socket_in_use(test_microvm_with_api):
     start due to the socket being left open from previous runs.
     Check that the error message is a fixed one and that it also
     contains the name of the path.
-
-    @type: functional
     """
-    microvm = test_microvm_with_api
+    microvm = uvm_plain
 
     cmd = "mkdir {}/run".format(microvm.chroot())
-    run_cmd(cmd)
+    check_output(cmd)
 
     sock = socket.socket(socket.AF_UNIX)
     sock.bind(microvm.jailer.api_socket_path())
     microvm.spawn()
     msg = "Failed to open the API socket at: /run/firecracker.socket. Check that it is not already used."
     microvm.check_log_message(msg)
+
+    microvm.mark_killed()

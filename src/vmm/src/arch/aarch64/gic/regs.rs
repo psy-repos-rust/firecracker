@@ -7,25 +7,24 @@ use std::ops::Range;
 
 use kvm_bindings::kvm_device_attr;
 use kvm_ioctls::DeviceFd;
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
+use serde::{Deserialize, Serialize};
 
-use crate::arch::aarch64::gic::{Error, Result};
+use crate::arch::aarch64::gic::GicError;
 
-#[derive(Debug)]
-pub struct GicRegState<T: Versionize> {
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GicRegState<T> {
     pub(crate) chunks: Vec<T>,
 }
 
 /// Structure for serializing the state of the Vgic ICC regs
-#[derive(Debug, Default, Versionize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct VgicSysRegsState {
     pub main_icc_regs: Vec<GicRegState<u64>>,
     pub ap_icc_regs: Vec<Option<GicRegState<u64>>>,
 }
 
 /// Structure used for serializing the state of the GIC registers.
-#[derive(Debug, Default, Versionize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct GicState {
     /// The state of the distributor registers.
     pub dist: Vec<GicRegState<u32>>,
@@ -34,37 +33,10 @@ pub struct GicState {
 }
 
 /// Structure used for serializing the state of the GIC registers for a specific vCPU.
-#[derive(Debug, Default, Versionize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct GicVcpuState {
     pub rdist: Vec<GicRegState<u32>>,
     pub icc: VgicSysRegsState,
-}
-
-impl<T: Versionize> Versionize for GicRegState<T> {
-    fn serialize<W: std::io::Write>(
-        &self,
-        writer: &mut W,
-        version_map: &VersionMap,
-        app_version: u16,
-    ) -> VersionizeResult<()> {
-        let chunks = &self.chunks;
-        assert_eq!(std::mem::size_of_val(chunks), std::mem::size_of::<Self>());
-        Versionize::serialize(chunks, writer, version_map, app_version)
-    }
-
-    fn deserialize<R: std::io::Read>(
-        reader: &mut R,
-        version_map: &VersionMap,
-        app_version: u16,
-    ) -> VersionizeResult<Self> {
-        let chunks = Versionize::deserialize(reader, version_map, app_version)?;
-        assert_eq!(std::mem::size_of_val(&chunks), std::mem::size_of::<Self>());
-        Ok(Self { chunks })
-    }
-
-    fn version() -> u16 {
-        1
-    }
 }
 
 pub(crate) trait MmioReg {
@@ -80,7 +52,7 @@ pub(crate) trait MmioReg {
 
 pub(crate) trait VgicRegEngine {
     type Reg: MmioReg;
-    type RegChunk: Clone + Default + Versionize;
+    type RegChunk: Clone + Default;
 
     fn group() -> u32;
 
@@ -102,15 +74,19 @@ pub(crate) trait VgicRegEngine {
         fd: &DeviceFd,
         reg: &Self::Reg,
         mpidr: u64,
-    ) -> Result<GicRegState<Self::RegChunk>>
+    ) -> Result<GicRegState<Self::RegChunk>, GicError>
     where
         Self: Sized,
     {
         let mut data = Vec::with_capacity(reg.iter::<Self::RegChunk>().count());
         for offset in reg.iter::<Self::RegChunk>() {
             let mut val = Self::RegChunk::default();
-            fd.get_device_attr(&mut Self::kvm_device_attr(offset, &mut val, mpidr))
-                .map_err(|err| Error::DeviceAttribute(err, false, Self::group()))?;
+            // SAFETY: `val` is a mutable memory location sized correctly for the attribute we're
+            // requesting
+            unsafe {
+                fd.get_device_attr(&mut Self::kvm_device_attr(offset, &mut val, mpidr))
+                    .map_err(|err| GicError::DeviceAttribute(err, false, Self::group()))?;
+            }
             data.push(val);
         }
 
@@ -121,7 +97,7 @@ pub(crate) trait VgicRegEngine {
         fd: &DeviceFd,
         regs: Box<dyn Iterator<Item = &Self::Reg>>,
         mpidr: u64,
-    ) -> Result<Vec<GicRegState<Self::RegChunk>>>
+    ) -> Result<Vec<GicRegState<Self::RegChunk>>, GicError>
     where
         Self: Sized,
     {
@@ -139,13 +115,13 @@ pub(crate) trait VgicRegEngine {
         reg: &Self::Reg,
         data: &GicRegState<Self::RegChunk>,
         mpidr: u64,
-    ) -> Result<()>
+    ) -> Result<(), GicError>
     where
         Self: Sized,
     {
         for (offset, val) in reg.iter::<Self::RegChunk>().zip(&data.chunks) {
             fd.set_device_attr(&Self::kvm_device_attr(offset, &mut val.clone(), mpidr))
-                .map_err(|err| Error::DeviceAttribute(err, true, Self::group()))?;
+                .map_err(|err| GicError::DeviceAttribute(err, true, Self::group()))?;
         }
 
         Ok(())
@@ -156,7 +132,7 @@ pub(crate) trait VgicRegEngine {
         regs: Box<dyn Iterator<Item = &Self::Reg>>,
         data: &[GicRegState<Self::RegChunk>],
         mpidr: u64,
-    ) -> Result<()>
+    ) -> Result<(), GicError>
     where
         Self: Sized,
     {

@@ -1,90 +1,27 @@
 # Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Pytest fixtures and redefined-outer-name don't mix well. Disable it.
-# pylint:disable=redefined-outer-name
-# We import some fixtures that are unused. Disable that too.
-# pylint:disable=unused-import
-
 """Imported by pytest at the start of every test session.
 
 # Fixture Goals
 
 Fixtures herein are made available to every test collected by pytest. They are
 designed with the following goals in mind:
+
 - Running a test on a microvm is as easy as importing a microvm fixture.
+
 - Adding a new microvm image (kernel, rootfs) for tests to run on is as easy as
-  uploading that image to a key-value store, e.g., an s3 bucket.
-
-# Solution
-
-- Keep microvm test images in an S3 bucket, structured as follows:
-
-``` tree
-s3://<bucket-url>/img/
-    <microvm_test_image_folder_n>/
-        kernel/
-            <optional_kernel_name.>vmlinux.bin
-        fsfiles/
-            <rootfs_name>rootfs.ext4
-            <other_fsfile_n>
-            ...
-        <other_resource_n>
-        ...
-    ...
-```
-
-- Tag `<microvm_test_image_folder_n>` with the capabilities of that image:
-
-``` json
-TagSet = [{"key": "capability:<cap_name>", "value": ""}, ...]
-```
-
-- Make available fixtures that expose microvms based on any given capability.
-  For example, a test function using the fixture `test_microvm_any` should run
-  on all microvm images in the S3 bucket, while a test using the fixture
-  `test_microvm_with_net` should only run on the microvm images tagged with
-  `capability:net`. Note that a test function that uses a parameterized fixture
-  will yield one test case for every possible parameter of that fixture. For
-  example, using `test_microvm_any` in a test will create as many test cases
-  as there are microvm images in the S3 bucket.
-
-- Provide fixtures that simplify other common testing operations, like http
-  over local unix domain sockets.
-
-# Example
-
-```
-def test_with_any_microvm(test_microvm_any):
-
-    response = test_microvm_any.machine_cfg.put(
-        vcpu_count=8
-    )
-    assert(test_microvm_any.api_session.is_good_response(response.status_code))
-
-    # [...]
-
-    response = test_microvm_any.actions.put(action_type='InstanceStart')
-    assert(test_microvm_any.api_session.is_good_response(response.status_code))
-```
-
-The test above makes use of the "any" test microvm fixture, so this test will
-be run on every microvm image in the bucket, each as a separate test case.
+  creating a fixture that references some local paths
 
 # Notes
 
 - Reading up on pytest fixtures is probably needed when editing this file.
-
-# TODO
-- A fixture that allows per-test-function dependency installation.
-- Support generating fixtures with more than one capability. This is supported
-  by the MicrovmImageFetcher, but not by the fixture template.
+  https://docs.pytest.org/en/7.2.x/explanation/fixtures.html
 """
 
 import inspect
+import json
 import os
-import platform
-import re
 import shutil
 import sys
 import tempfile
@@ -94,19 +31,15 @@ import pytest
 
 import host_tools.cargo_build as build_tools
 from framework import defs, utils
-from framework.artifacts import ArtifactCollection, DiskArtifact, FirecrackerArtifact
-from framework.defs import _test_images_s3_bucket
-from framework.microvm import Microvm
+from framework.artifacts import disks, kernel_params
+from framework.microvm import MicroVMFactory
 from framework.properties import global_props
-from framework.s3fetcher import MicrovmImageS3Fetcher
-from framework.utils import get_firecracker_version_from_toml, is_io_uring_supported
-from framework.utils_cpu_templates import SUPPORTED_CPU_TEMPLATES
-from framework.with_filelock import with_filelock
-from host_tools.ip_generator import network_config, subnet_generator
+from framework.utils_cpu_templates import (
+    custom_cpu_templates_params,
+    static_cpu_templates_params,
+)
 from host_tools.metrics import get_metrics_logger
-
-# Tests root directory.
-SCRIPT_FOLDER = os.path.dirname(os.path.realpath(__file__))
+from host_tools.network import NetNs
 
 # This codebase uses Python features available in Python 3.10 or above
 if sys.version_info < (3, 10):
@@ -118,40 +51,46 @@ if os.geteuid() != 0:
     raise PermissionError("Test session needs to be run as root.")
 
 
-ARTIFACTS_COLLECTION = ArtifactCollection(_test_images_s3_bucket())
-MICROVM_S3_FETCHER = MicrovmImageS3Fetcher(_test_images_s3_bucket())
 METRICS = get_metrics_logger()
-
-
-def pytest_configure(config):
-    """Pytest hook - initialization"""
-    config.addinivalue_line("markers", "nonci: mark test as nonci.")
+PHASE_REPORT_KEY = pytest.StashKey[dict[str, pytest.CollectReport]]()
 
 
 def pytest_addoption(parser):
     """Pytest hook. Add command line options."""
     parser.addoption(
-        "--dump-results-to-file",
-        action="store_true",
-        help="Flag to dump test results to the test_results folder.",
+        "--binary-dir",
+        action="store",
+        help="use firecracker/jailer binaries from this directory instead of compiling from source",
     )
-    parser.addoption("--nonci", action="store_true", help="run tests marked with nonci")
+
+    parser.addoption(
+        "--custom-cpu-template",
+        action="store",
+        help="Path to custom CPU template to be applied unless overwritten by a test",
+        default=None,
+        type=Path,
+    )
 
 
-def pytest_collection_modifyitems(config, items):
-    """Pytest hook. Skip some tests."""
-    skip_markers = {}
+def pytest_report_header():
+    """Pytest hook to print relevant metadata in the logs"""
+    return f"EC2 AMI: {global_props.ami}"
 
-    for skip_marker_name in ["nonci"]:
-        if not config.getoption(f"--{skip_marker_name}"):
-            skip_markers[skip_marker_name] = pytest.mark.skip(
-                reason=f"Skipping {skip_marker_name} test"
-            )
 
-    for item in items:
-        for skip_marker_name, skip_marker in skip_markers.items():
-            if skip_marker_name in item.keywords:
-                item.add_marker(skip_marker)
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_makereport(item, call):  # pylint:disable=unused-argument
+    """Plugin to get test results in fixtures
+
+    https://docs.pytest.org/en/latest/example/simple.html#making-test-result-information-available-in-fixtures
+    """
+    # execute all other hooks to obtain the report object
+    rep = yield
+
+    # store test results for each phase of a call, which can
+    # be "setup", "call", "teardown"
+    item.stash.setdefault(PHASE_REPORT_KEY, {})[rep.when] = rep
+
+    return rep
 
 
 @pytest.fixture(scope="function", autouse=True)
@@ -170,45 +109,63 @@ def record_props(request, record_property):
 
     # Extract attributes from the docstrings
     function_docstring = inspect.getdoc(request.function)
-    description = []
-    attributes = {}
-    for line in function_docstring.split("\n"):
-        # extract tags like @type, @issue, etc
-        match = re.match(r"\s*@(?P<attr>\w+):\s*(?P<value>\w+)", line)
-        if match:
-            attr, value = match["attr"], match["value"]
-            attributes[attr] = value
-        else:
-            description.append(line)
-    for attr_name, attr_value in attributes.items():
-        record_property(attr_name, attr_value)
-    record_property("description", "".join(description))
+    record_property("description", function_docstring)
 
 
 def pytest_runtest_logreport(report):
     """Send general test metrics to CloudWatch"""
-    if report.when == "call":
-        dimensions = {
+
+    # only publish metrics from the main process
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER")
+    if worker_id is not None:
+        return
+
+    # The pytest's test protocol has three phases for each test item: setup,
+    # call and teardown. At the end of each phase, pytest_runtest_logreport()
+    # is called.
+    # https://github.com/pytest-dev/pytest/blob/d489247505a953885a156e61d4473497cbc167ea/src/_pytest/hookspec.py#L643
+    # https://github.com/pytest-dev/pytest/blob/d489247505a953885a156e61d4473497cbc167ea/src/_pytest/hookspec.py#L800
+    METRICS.set_dimensions(
+        # fine-grained
+        {
             "test": report.nodeid,
             "instance": global_props.instance,
             "cpu_model": global_props.cpu_model,
             "host_kernel": "linux-" + global_props.host_linux_version,
-        }
-        METRICS.set_property("result", report.outcome)
-        for prop_name, prop_val in report.user_properties:
-            METRICS.set_property(prop_name, prop_val)
-        METRICS.set_dimensions(dimensions)
-        METRICS.put_metric(
-            "duration",
-            report.duration,
-            unit="Seconds",
-        )
-        METRICS.put_metric(
-            "failed",
-            1 if report.outcome == "failed" else 0,
-            unit="Count",
-        )
-        METRICS.flush()
+            "phase": report.when,
+        },
+        # per test
+        {
+            "test": report.nodeid,
+            "instance": global_props.instance,
+            "cpu_model": global_props.cpu_model,
+            "host_kernel": "linux-" + global_props.host_linux_version,
+        },
+        # per phase
+        {"phase": report.when},
+        # per host kernel
+        {"host_kernel": "linux-" + global_props.host_linux_version},
+        # per CPU
+        {"cpu_model": global_props.cpu_model},
+        # and global
+        {},
+    )
+    METRICS.set_property("pytest_xdist_worker", worker_id)
+    METRICS.set_property("result", report.outcome)
+    METRICS.set_property("location", report.location)
+    for prop_name, prop_val in report.user_properties:
+        METRICS.set_property(prop_name, prop_val)
+    METRICS.put_metric(
+        "duration",
+        report.duration,
+        unit="Seconds",
+    )
+    METRICS.put_metric(
+        "failed",
+        1 if report.outcome == "failed" else 0,
+        unit="Count",
+    )
+    METRICS.flush()
 
 
 @pytest.fixture()
@@ -253,35 +210,13 @@ def test_fc_session_root_path():
         prefix="fctest-", dir=defs.DEFAULT_TEST_SESSION_ROOT_PATH
     )
     yield fc_session_root_path
-    shutil.rmtree(fc_session_root_path)
-
-
-@with_filelock
-def _gcc_compile(src_file, output_file, extra_flags="-static -O3"):
-    """Build a source file with gcc."""
-    output_file = Path(output_file)
-    if not output_file.exists():
-        compile_cmd = f"gcc {src_file} -o {output_file} {extra_flags}"
-        utils.run_cmd(compile_cmd)
-
-
-@pytest.fixture(scope="session")
-def bin_cloner_path(test_fc_session_root_path):
-    """Build a binary that `clone`s into the jailer.
-
-    It's necessary because Python doesn't interface well with the `clone()`
-    syscall directly.
-    """
-    cloner_bin_path = os.path.join(test_fc_session_root_path, "newpid_cloner")
-    _gcc_compile("host_tools/newpid_cloner.c", cloner_bin_path)
-    yield cloner_bin_path
 
 
 @pytest.fixture(scope="session")
 def bin_vsock_path(test_fc_session_root_path):
     """Build a simple vsock client/server application."""
     vsock_helper_bin_path = os.path.join(test_fc_session_root_path, "vsock_helper")
-    _gcc_compile("host_tools/vsock_helper.c", vsock_helper_bin_path)
+    build_tools.gcc_compile("host_tools/vsock_helper.c", vsock_helper_bin_path)
     yield vsock_helper_bin_path
 
 
@@ -291,7 +226,7 @@ def change_net_config_space_bin(test_fc_session_root_path):
     change_net_config_space_bin = os.path.join(
         test_fc_session_root_path, "change_net_config_space"
     )
-    _gcc_compile(
+    build_tools.gcc_compile(
         "host_tools/change_net_config_space.c",
         change_net_config_space_bin,
         extra_flags="-static",
@@ -299,8 +234,8 @@ def change_net_config_space_bin(test_fc_session_root_path):
     yield change_net_config_space_bin
 
 
-@pytest.fixture(scope="session")
-def bin_seccomp_paths(test_fc_session_root_path):
+@pytest.fixture
+def bin_seccomp_paths():
     """Build jailers and jailed binaries to test seccomp.
 
     They currently consist of:
@@ -309,250 +244,346 @@ def bin_seccomp_paths(test_fc_session_root_path):
     * a jailed binary that follows the seccomp rules;
     * a jailed binary that breaks the seccomp rules.
     """
-    seccomp_build_path = os.path.join(
-        test_fc_session_root_path, build_tools.CARGO_RELEASE_REL_PATH
-    )
-
-    extra_args = "--release --target {}-unknown-linux-musl"
-    extra_args = extra_args.format(platform.machine())
-    build_tools.cargo_build(
-        seccomp_build_path,
-        extra_args=extra_args,
-        src_dir="integration_tests/security/demo_seccomp",
-    )
-
-    release_binaries_path = os.path.join(
-        test_fc_session_root_path,
-        build_tools.CARGO_RELEASE_REL_PATH,
-        build_tools.RELEASE_BINARIES_REL_PATH,
-    )
-
-    demo_jailer = os.path.normpath(os.path.join(release_binaries_path, "demo_jailer"))
-    demo_harmless = os.path.normpath(
-        os.path.join(release_binaries_path, "demo_harmless")
-    )
-    demo_malicious = os.path.normpath(
-        os.path.join(release_binaries_path, "demo_malicious")
-    )
-    demo_panic = os.path.normpath(os.path.join(release_binaries_path, "demo_panic"))
-
-    yield {
-        "demo_jailer": demo_jailer,
-        "demo_harmless": demo_harmless,
-        "demo_malicious": demo_malicious,
-        "demo_panic": demo_panic,
+    demos = {
+        f"demo_{example}": build_tools.get_example(f"seccomp_{example}")
+        for example in ["jailer", "harmless", "malicious", "panic"]
     }
-
-
-@pytest.fixture(scope="session")
-def uffd_handler_paths(test_fc_session_root_path):
-    """Build UFFD handler binaries."""
-    uffd_build_path = os.path.join(
-        test_fc_session_root_path, build_tools.CARGO_RELEASE_REL_PATH
-    )
-
-    extra_args = "--release --target {}-unknown-linux-musl"
-    extra_args = extra_args.format(platform.machine())
-    build_tools.cargo_build(
-        uffd_build_path, extra_args=extra_args, src_dir="host_tools/uffd"
-    )
-
-    release_binaries_path = os.path.join(
-        test_fc_session_root_path,
-        build_tools.CARGO_RELEASE_REL_PATH,
-        build_tools.RELEASE_BINARIES_REL_PATH,
-    )
-
-    valid_handler = os.path.normpath(
-        os.path.join(release_binaries_path, "valid_handler")
-    )
-
-    malicious_handler = os.path.normpath(
-        os.path.join(release_binaries_path, "malicious_handler")
-    )
-
-    yield {
-        "valid_handler": valid_handler,
-        "malicious_handler": malicious_handler,
-    }
-
-
-@pytest.fixture()
-def microvm(test_fc_session_root_path, bin_cloner_path):
-    """Instantiate a microvm."""
-    # Make sure the necessary binaries are there before instantiating the
-    # microvm.
-    vm = Microvm(
-        resource_path=test_fc_session_root_path,
-        bin_cloner_path=bin_cloner_path,
-    )
-    yield vm
-    vm.kill()
-    shutil.rmtree(os.path.join(test_fc_session_root_path, vm.id))
+    yield demos
 
 
 @pytest.fixture
-def fc_tmp_path(test_fc_session_root_path):
-    """A tmp_path substitute
+def uffd_handler_paths():
+    """Build UFFD handler binaries."""
+    handlers = {
+        f"{handler}_handler": build_tools.get_example(f"uffd_{handler}_handler")
+        for handler in ["malicious", "valid", "fault_all"]
+    }
+    yield handlers
 
-    We should use pytest's tmp_path fixture instead of this, but this can create
-    very long paths, which can run into the UDS 108 character limit.
+
+@pytest.fixture(scope="session")
+def netns_factory(worker_id):
+    """A network namespace factory
+
+    Network namespaces are created once per test session and re-used in subsequent tests.
     """
-    return Path(tempfile.mkdtemp(dir=test_fc_session_root_path))
+    # pylint:disable=protected-access
+
+    class NetNsFactory:
+        """A Network namespace factory that reuses namespaces."""
+
+        def __init__(self, prefix: str):
+            self._all = []
+            self._returned = []
+            self.prefix = prefix
+
+        def get(self, _netns_id):
+            """Get a free network namespace"""
+            if len(self._returned) > 0:
+                ns = self._returned.pop(0)
+                while ns.is_used():
+                    pass
+                return ns
+            ns = NetNs(self.prefix + str(len(self._all)))
+            # change the cleanup function so it is returned to the pool
+            ns._cleanup_orig = ns.cleanup
+            ns.cleanup = lambda: self._returned.append(ns)
+            self._all.append(ns)
+            return ns
+
+    netns_fcty = NetNsFactory(f"netns-{worker_id}-")
+    yield netns_fcty.get
+
+    for netns in netns_fcty._all:
+        netns._cleanup_orig()
 
 
 @pytest.fixture()
-def microvm_factory(fc_tmp_path, bin_cloner_path):
-    """Fixture to create microvms simply.
+def microvm_factory(request, record_property, results_dir, netns_factory):
+    """Fixture to create microvms simply."""
 
-    In order to avoid running out of space when instantiating many microvms,
-    we remove the directory manually when the fixture is destroyed
-    (that is after every test).
-    One can comment the removal line, if it helps with debugging.
-    """
+    if binary_dir := request.config.getoption("--binary-dir"):
+        fc_binary_path = Path(binary_dir) / "firecracker"
+        jailer_binary_path = Path(binary_dir) / "jailer"
+        if not fc_binary_path.exists():
+            raise RuntimeError("Firecracker binary does not exist")
+    else:
+        fc_binary_path, jailer_binary_path = build_tools.get_firecracker_binaries()
+    record_property("firecracker_bin", str(fc_binary_path))
 
-    class MicroVMFactory:
-        """MicroVM factory"""
-
-        def __init__(self, tmp_path, bin_cloner):
-            self.tmp_path = Path(tmp_path)
-            self.bin_cloner_path = bin_cloner
-            self.vms = []
-
-        def build(self, kernel=None, rootfs=None, **kwargs):
-            """Build a microvm"""
-            vm = Microvm(
-                resource_path=self.tmp_path,
-                bin_cloner_path=self.bin_cloner_path,
-                **kwargs,
-            )
-            self.vms.append(vm)
-            if kernel is not None:
-                kernel_path = Path(kernel.local_path())
-                vm.kernel_file = kernel_path
-            if rootfs is not None:
-                rootfs_path = Path(rootfs.local_path())
-                rootfs_path2 = Path(vm.path) / rootfs_path.name
-                # TBD only iff ext4 / rw
-                shutil.copyfile(rootfs_path, rootfs_path2)
-                vm.rootfs_file = rootfs_path2
-                vm.ssh_config["ssh_key_path"] = rootfs.ssh_key().local_path()
-            return vm
-
-        def kill(self):
-            """Clean up all built VMs"""
-            for vm in self.vms:
-                vm.kill()
-            shutil.rmtree(self.tmp_path)
-
-    uvm_factory = MicroVMFactory(fc_tmp_path, bin_cloner_path)
+    # If `--custom-cpu-template` option is provided, the given CPU template will
+    # be applied afterwards unless overwritten.
+    custom_cpu_template_path = request.config.getoption("--custom-cpu-template")
+    custom_cpu_template = (
+        {
+            "name": custom_cpu_template_path.stem,
+            "template": json.loads(custom_cpu_template_path.read_text("utf-8")),
+        }
+        if custom_cpu_template_path
+        else None
+    )
+    # We could override the chroot base like so
+    # jailer_kwargs={"chroot_base": "/srv/jailo"}
+    uvm_factory = MicroVMFactory(
+        fc_binary_path,
+        jailer_binary_path,
+        netns_factory=netns_factory,
+        custom_cpu_template=custom_cpu_template,
+    )
     yield uvm_factory
+
+    # if the test failed, save important files from the root of the uVM into `test_results` for troubleshooting
+    report = request.node.stash[PHASE_REPORT_KEY]
+    if "call" in report and report["call"].failed:
+        dmesg = utils.run_cmd(["dmesg", "-dPx"])
+        for uvm in uvm_factory.vms:
+            uvm_data = results_dir / uvm.id
+            uvm_data.mkdir()
+            uvm_data.joinpath("host-dmesg.log").write_text(dmesg.stdout)
+
+            uvm_root = Path(uvm.chroot())
+            for item in os.listdir(uvm_root):
+                src = uvm_root / item
+                if not os.path.isfile(src):
+                    continue
+                dst = uvm_data / item
+                shutil.copy(src, dst)
+                console_data = uvm.console_data
+                if console_data:
+                    uvm_data.joinpath("guest-console.log").write_text(console_data)
+
     uvm_factory.kill()
 
 
-def firecracker_id(fc):
-    """Render a nice ID for pytest parametrize."""
-    if isinstance(fc, FirecrackerArtifact):
-        return f"firecracker-{fc.version}"
-    return None
-
-
-def firecracker_artifacts(*args, **kwargs):
-    """Return all supported firecracker binaries."""
-    max_version = [int(x) for x in get_firecracker_version_from_toml().split(".")]
-    # until the next minor version (but not including)
-    max_version[1] += 1
-    params = {
-        "min_version": "1.2.0",
-        "max_version_open": ".".join(str(x) for x in max_version),
-    }
-    params.update(kwargs)
-    return ARTIFACTS_COLLECTION.firecrackers(*args, **params)
-
-
-@pytest.fixture(params=firecracker_artifacts(), ids=firecracker_id)
-def firecracker_release(request, record_property):
-    """Return all supported firecracker binaries."""
-    firecracker = request.param
-    firecracker.download(perms=0o555)
-    firecracker.jailer().download(perms=0o555)
-    record_property("firecracker_release", firecracker.version)
-    return firecracker
-
-
-@pytest.fixture(params=ARTIFACTS_COLLECTION.kernels(), ids=lambda kernel: kernel.name())
-def guest_kernel(request, record_property):
-    """Return all supported guest kernels."""
-    kernel = request.param
-    # linux-major.minor
-    kernel.prop = "linux-" + kernel.name().removesuffix(".bin").split("-")[-1]
-    record_property("guest_kernel", kernel.prop)
-    kernel.download()
-    return kernel
-
-
-@pytest.fixture(params=ARTIFACTS_COLLECTION.disks("ubuntu"), ids=lambda fs: fs.name())
-def rootfs(request, record_property):
-    """Return all supported rootfs."""
-    fs = request.param
-    record_property("rootfs", fs.name())
-    fs.download()
-    fs.ssh_key().download()
-    return fs
-
-
-@pytest.fixture(
-    params=ARTIFACTS_COLLECTION.disks("bionic-msrtools"),
-    ids=lambda fs: fs.name() if isinstance(fs, DiskArtifact) else None,
-)
-def rootfs_msrtools(request, record_property):
-    """Common disk fixture for tests needing msrtools
-
-    When we regenerate the rootfs, we should include this always
-    """
-    fs = request.param
-    record_property("rootfs", fs.name())
-    fs.download()
-    fs.ssh_key().download()
-    return fs
-
-
-@pytest.fixture(params=SUPPORTED_CPU_TEMPLATES)
-def cpu_template(request, record_property):
-    """Return all CPU templates supported by the vendor."""
-    record_property("cpu_template", request.param)
+@pytest.fixture(params=custom_cpu_templates_params())
+def custom_cpu_template(request, record_property):
+    """Return all dummy custom CPU templates supported by the vendor."""
+    record_property("custom_cpu_template", request.param["name"])
     return request.param
 
 
-TEST_MICROVM_CAP_FIXTURE_TEMPLATE = (
-    "@pytest.fixture("
-    "    params=MICROVM_S3_FETCHER.list_microvm_images(\n"
-    "        capability_filter=['CAP']\n"
-    "    )\n"
-    ")\n"
-    "def test_microvm_with_CAP(request, microvm):\n"
-    "    MICROVM_S3_FETCHER.init_vm_resources(\n"
-    "        request.param, microvm\n"
-    "    )\n"
-    "    yield microvm"
+@pytest.fixture(
+    params=[
+        pytest.param(None, id="NO_CPU_TMPL"),
+        *static_cpu_templates_params(),
+        *custom_cpu_templates_params(),
+    ],
 )
-
-# To make test writing easy, we want to dynamically create fixtures with all
-# capabilities present in the test microvm images bucket. `pytest` doesn't
-# provide a way to do that outright, but luckily all of python is just lists of
-# of lists and a cursor, so exec() works fine here.
-for capability in MICROVM_S3_FETCHER.enum_capabilities():
-    TEST_MICROVM_CAP_FIXTURE = TEST_MICROVM_CAP_FIXTURE_TEMPLATE.replace(
-        "CAP", capability
-    )
-    # pylint: disable=exec-used
-    # This is the most straightforward way to achieve this result.
-    exec(TEST_MICROVM_CAP_FIXTURE)
+def cpu_template_any(request, record_property):
+    """This fixture combines no template, static and custom CPU templates"""
+    cpu_template_name = request.param
+    if request.param is None:
+        cpu_template_name = "None"
+    elif "name" in request.param:
+        cpu_template_name = request.param["name"]
+    record_property("cpu_template", cpu_template_name)
+    return request.param
 
 
 @pytest.fixture(params=["Sync", "Async"])
 def io_engine(request):
     """All supported io_engines"""
-    if request.param == "Async" and not is_io_uring_supported():
+    if request.param == "Async" and not utils.is_io_uring_supported():
         pytest.skip("io_uring not supported in this kernel")
     return request.param
+
+
+@pytest.fixture
+def results_dir(request):
+    """
+    Fixture yielding the path to a directory into which the test can dump its results
+
+    Directories are unique per test, and named after the test name. Everything the tests puts
+    into its directory will to be uploaded to S3. Directory will be placed inside defs.TEST_RESULTS_DIR.
+
+    For example
+    ```py
+    def test_my_file(results_dir):
+        (results_dir / "output.txt").write_text("Hello World")
+    ```
+    will result in `defs.TEST_RESULTS_DIR`/test_my_file/output.txt.
+    """
+    results_dir = defs.TEST_RESULTS_DIR / request.node.originalname
+    results_dir.mkdir(parents=True, exist_ok=True)
+    return results_dir
+
+
+def guest_kernel_fxt(request, record_property):
+    """Return all supported guest kernels."""
+    kernel = request.param
+    # vmlinux-5.10.167 -> linux-5.10
+    prop = kernel.stem[2:]
+    record_property("guest_kernel", prop)
+    return kernel
+
+
+# Fixtures for all guest kernels, and specific versions
+guest_kernel = pytest.fixture(guest_kernel_fxt, params=kernel_params("vmlinux-*"))
+guest_kernel_acpi = pytest.fixture(
+    guest_kernel_fxt,
+    params=filter(
+        lambda kernel: "no-acpi" not in kernel.id, kernel_params("vmlinux-*")
+    ),
+)
+guest_kernel_linux_5_10 = pytest.fixture(
+    guest_kernel_fxt,
+    params=filter(
+        lambda kernel: "no-acpi" not in kernel.id, kernel_params("vmlinux-5.10*")
+    ),
+)
+guest_kernel_linux_6_1 = pytest.fixture(
+    guest_kernel_fxt,
+    params=kernel_params("vmlinux-6.1*"),
+)
+
+
+@pytest.fixture
+def rootfs():
+    """Return an Ubuntu 24.04 read-only rootfs"""
+    return disks("ubuntu-24.04.squashfs")[0]
+
+
+@pytest.fixture
+def rootfs_rw():
+    """Return an Ubuntu 24.04 ext4 rootfs"""
+    return disks("ubuntu-24.04.ext4")[0]
+
+
+@pytest.fixture
+def uvm_plain(microvm_factory, guest_kernel_linux_5_10, rootfs):
+    """Create a vanilla VM, non-parametrized"""
+    return microvm_factory.build(guest_kernel_linux_5_10, rootfs)
+
+
+@pytest.fixture
+def uvm_plain_rw(microvm_factory, guest_kernel_linux_5_10, rootfs_rw):
+    """Create a vanilla VM, non-parametrized"""
+    return microvm_factory.build(guest_kernel_linux_5_10, rootfs_rw)
+
+
+@pytest.fixture
+def uvm_nano(uvm_plain):
+    """A preconfigured uvm with 2vCPUs and 256MiB of memory
+    ready to .start()
+    """
+    uvm_plain.spawn()
+    uvm_plain.basic_config(vcpu_count=2, mem_size_mib=256)
+    return uvm_plain
+
+
+@pytest.fixture()
+def artifact_dir():
+    """Return the location of the CI artifacts"""
+    return defs.ARTIFACT_DIR
+
+
+@pytest.fixture
+def uvm_plain_any(microvm_factory, guest_kernel, rootfs):
+    """All guest kernels
+    kernel: all
+    rootfs: Ubuntu 24.04
+    """
+    return microvm_factory.build(guest_kernel, rootfs)
+
+
+guest_kernel_6_1_debug = pytest.fixture(
+    guest_kernel_fxt,
+    params=kernel_params("vmlinux-6.1*", artifact_dir=defs.ARTIFACT_DIR / "debug"),
+)
+
+
+@pytest.fixture
+def uvm_plain_debug(microvm_factory, guest_kernel_6_1_debug, rootfs_rw):
+    """VM running a kernel with debug/trace Kconfig options"""
+    return microvm_factory.build(guest_kernel_6_1_debug, rootfs_rw)
+
+
+@pytest.fixture
+def uvm_with_initrd(
+    microvm_factory, guest_kernel_linux_5_10, record_property, artifact_dir
+):
+    """
+    See file:../docs/initrd.md
+    """
+    fs = artifact_dir / "initramfs.cpio"
+    record_property("rootfs", fs.name)
+    uvm = microvm_factory.build(guest_kernel_linux_5_10)
+    uvm.initrd_file = fs
+    yield uvm
+
+
+@pytest.fixture
+def vcpu_count():
+    """Return default vcpu_count. Use indirect parametrization to override."""
+    return 2
+
+
+@pytest.fixture
+def mem_size_mib():
+    """Return memory size. Use indirect parametrization to override."""
+    return 256
+
+
+def uvm_booted(
+    microvm_factory, guest_kernel, rootfs, cpu_template, vcpu_count=2, mem_size_mib=256
+):
+    """Return a booted uvm"""
+    uvm = microvm_factory.build(guest_kernel, rootfs)
+    uvm.spawn()
+    uvm.basic_config(vcpu_count=vcpu_count, mem_size_mib=mem_size_mib)
+    uvm.set_cpu_template(cpu_template)
+    uvm.add_net_iface()
+    uvm.start()
+    return uvm
+
+
+def uvm_restored(microvm_factory, guest_kernel, rootfs, cpu_template, **kwargs):
+    """Return a restored uvm"""
+    uvm = uvm_booted(microvm_factory, guest_kernel, rootfs, cpu_template, **kwargs)
+    snapshot = uvm.snapshot_full()
+    uvm.kill()
+    uvm2 = microvm_factory.build_from_snapshot(snapshot)
+    uvm2.cpu_template_name = uvm.cpu_template_name
+    return uvm2
+
+
+@pytest.fixture(params=[uvm_booted, uvm_restored])
+def uvm_ctor(request):
+    """Fixture to return uvms with different constructors"""
+    return request.param
+
+
+@pytest.fixture
+def uvm_any(
+    microvm_factory,
+    uvm_ctor,
+    guest_kernel,
+    rootfs,
+    cpu_template_any,
+    vcpu_count,
+    mem_size_mib,
+):
+    """Return booted and restored uvms"""
+    return uvm_ctor(
+        microvm_factory,
+        guest_kernel,
+        rootfs,
+        cpu_template_any,
+        vcpu_count=vcpu_count,
+        mem_size_mib=mem_size_mib,
+    )
+
+
+@pytest.fixture
+def uvm_any_booted(
+    microvm_factory, guest_kernel, rootfs, cpu_template_any, vcpu_count, mem_size_mib
+):
+    """Return booted uvms"""
+    return uvm_booted(
+        microvm_factory,
+        guest_kernel,
+        rootfs,
+        cpu_template_any,
+        vcpu_count=vcpu_count,
+        mem_size_mib=mem_size_mib,
+    )

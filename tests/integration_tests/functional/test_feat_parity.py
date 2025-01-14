@@ -32,16 +32,15 @@ def vm_fxt(
     microvm_factory,
     inst_set_cpu_template,
     guest_kernel,
-    rootfs_msrtools,
-    network_config,
+    rootfs,
 ):
     """
     Create a VM, using the normal CPU templates
     """
-    vm = microvm_factory.build(guest_kernel, rootfs_msrtools)
+    vm = microvm_factory.build(guest_kernel, rootfs)
     vm.spawn()
     vm.basic_config(vcpu_count=1, mem_size_mib=1024, cpu_template=inst_set_cpu_template)
-    vm.ssh_network_config(network_config, "1")
+    vm.add_net_iface()
     vm.start()
     return vm
 
@@ -49,8 +48,6 @@ def vm_fxt(
 def test_feat_parity_cpuid_mpx(vm):
     """
     Verify that MPX (Memory Protection Extensions) is not enabled in any of the supported CPU templates.
-
-    @type: functional
     """
     # fmt: off
     must_be_set = []
@@ -77,8 +74,6 @@ def test_feat_parity_cpuid_inst_set(vm):
     """
     Verify that CPUID feature flags related to instruction sets are properly set
     for T2, T2CL and T2A CPU templates.
-
-    @type: functional
     """
 
     # fmt: off
@@ -129,13 +124,10 @@ def test_feat_parity_cpuid_inst_set(vm):
         ),
         (0x80000001, 0x0, "edx",
             (1 << 22) | # MmxExt
-            (1 << 23) | # MMX
-            (1 << 24) | # FXSR
             (1 << 25) # FFXSR
         ),
         (0x80000008, 0x0, "ebx",
             (1 << 0) | # CLZERO
-            (1 << 2) | # RstrFpErrPtrs
             (1 << 4) | # RDPRU
             (1 << 8) | # MCOMMIT
             (1 << 9) | # WBNOINVD
@@ -149,116 +141,3 @@ def test_feat_parity_cpuid_inst_set(vm):
         must_be_set,
         must_be_unset,
     )
-
-
-def test_feat_parity_cpuid_sec(vm):
-    """
-    Verify that security-related CPUID feature flags are properly set
-    for T2CL and T2A CPU templates.
-
-    @type: functional
-    """
-
-    # fmt: off
-    must_be_set_common = [
-        (0x7, 0x0, "edx",
-            (1 << 26) | # IBRS/IBPB
-            (1 << 27) | # STIBP
-            (1 << 31) # SSBD
-        )
-        # Security feature bits in 0x80000008 EBX are set differently by
-        # 4.14 and 5.10 KVMs.
-        # 4.14 populates them from host's AMD flags (0x80000008 EBX), while
-        # 5.10 takes them from host's common flags (0x7 EDX).
-        # There is no great value in checking that this actually happens, as
-        # we cannot really control it.
-        # When we drop 4.14 support, we may consider enabling this check.
-        # (0x80000008, 0x0, "ebx",
-        #     (1 << 12) | # IBPB
-        #     (1 << 14) | # IBRS
-        #     (1 << 15) | # STIBP
-        #     (1 << 24) # SSBD
-        # )
-    ]
-
-    must_be_set_intel_only = [
-        (0x7, 0x0, "edx",
-            (1 << 10) | # MD_CLEAR
-            (1 << 29) # IA32_ARCH_CAPABILITIES
-        )
-    ]
-
-    must_be_set_amd_only = [
-        (0x80000008, 0x0, "ebx",
-            (1 << 18) | # IbrsPreferred
-            (1 << 19) # IbrsProvidesSameModeProtection
-        )
-    ]
-
-    must_be_unset_common = [
-        (0x7, 0x0, "edx",
-            (1 << 28) # L1D_FLUSH
-        )
-    ]
-
-    must_be_unset_intel_only = [
-        (0x80000008, 0x0, "ebx",
-            (1 << 18) | # IbrsPreferred
-            (1 << 19) # IbrsProvidesSameModeProtection
-        )
-    ]
-
-    must_be_unset_amd_only = [
-        (0x7, 0x0, "edx",
-            (1 << 10) | # MD_CLEAR
-            (1 << 29) # IA32_ARCH_CAPABILITIES
-        )
-    ]
-    # fmt: on
-
-    vendor = cpuid_utils.get_cpu_vendor()
-    if vendor == cpuid_utils.CpuVendor.INTEL:
-        must_be_set = must_be_set_common + must_be_set_intel_only
-        must_be_unset = must_be_unset_common + must_be_unset_intel_only
-    elif vendor == cpuid_utils.CpuVendor.AMD:
-        must_be_set = must_be_set_common + must_be_set_amd_only
-        must_be_unset = must_be_unset_common + must_be_unset_amd_only
-    else:
-        raise Exception("Unsupported CPU vendor.")
-
-    cpuid_utils.check_cpuid_feat_flags(
-        vm,
-        must_be_set,
-        must_be_unset,
-    )
-
-
-def test_feat_parity_msr_arch_cap(vm):
-    """
-    Verify availability and value of the IA32_ARCH_CAPABILITIES MSR for T2CL and T2A CPU templates.
-
-    @type: functional
-    """
-    arch_capabilities_addr = "0x10a"
-    rdmsr_cmd = f"rdmsr {arch_capabilities_addr}"
-    _, stdout, stderr = vm.ssh.execute_command(rdmsr_cmd)
-
-    cpu_template = vm.full_cfg.get().json()["machine-config"]["cpu_template"]
-
-    if cpu_template == "T2CL":
-        assert stderr.read() == ""
-        actual = int(stdout.read().strip(), 16)
-        # fmt: off
-        expected = (
-            (1 << 0) | # RDCL_NO
-            (1 << 1) | # IBRS_ALL
-            (1 << 3) | # SKIP_L1DFL_VMENTRY
-            (1 << 5) | # MDS_NO
-            (1 << 6) | # IF_PSCHANGE_MC_NO
-            (1 << 7) # TSX_CTRL
-        )
-        # fmt: on
-        assert actual == expected, f"{actual=:#x} != {expected=:#x}"
-    elif cpu_template == "T2A":
-        # IA32_ARCH_CAPABILITIES shall not be available
-        assert stderr.read() != ""

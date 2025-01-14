@@ -11,20 +11,12 @@
 ARG0=${BASH_SOURCE[-1]}
 MY_NAME="Firecracker $(basename "$ARG0")"
 
-# Send a decorated message to stdout, followed by a new line
+# Send a decorated message to stderr, followed by a new line
 #
 say() {
     [ -t 1 ] && [ -n "$TERM" ] \
-        && echo "$(tput setaf 2)[$MY_NAME]$(tput sgr0) $*" \
-        || echo "[$MY_NAME] $*"
-}
-
-# Send a decorated message to stdout, without a trailing new line
-#
-say_noln() {
-    [ -t 1 ] && [ -n "$TERM" ] \
-        && echo -n "$(tput setaf 2)[$MY_NAME]$(tput sgr0) $*" \
-        || echo "[$MY_NAME] $*"
+        && echo "$(tput setaf 2)[$MY_NAME $(date -Iseconds)]$(tput sgr0) $*" 1>&2 \
+        || echo "[$MY_NAME] $*" 1>&2
 }
 
 # Send a text message to stderr
@@ -35,11 +27,11 @@ say_err() {
         || echo -e "[$MY_NAME] $*" 1>&2
 }
 
-# Send a warning-highlighted text to stdout
+# Send a warning-highlighted text to stderr
 say_warn() {
     [ -t 1 ] && [ -n "$TERM" ] \
-        && echo "$(tput setaf 3)[$MY_NAME] $*$(tput sgr0)" \
-        || echo "[$MY_NAME] $*"
+        && echo "$(tput setaf 3)[$MY_NAME] $*$(tput sgr0)" 1>&2 \
+        || echo "[$MY_NAME] $*" 1>&2
 }
 
 # Exit with an error message and (optional) code
@@ -79,12 +71,7 @@ function SGR {
 #   exit code 0 for successful confirmation
 #   exit code != 0 if the user declined
 #
-OPT_UNATTENDED=false
 get_user_confirmation() {
-
-    # Pass if running unattended
-    [[ "$OPT_UNATTENDED" = true ]] && return 0
-
     # Fail if STDIN is not a terminal (there's no user to confirm anything)
     [[ -t 0 ]] || return 1
 
@@ -92,8 +79,7 @@ get_user_confirmation() {
     #
     msg=$([ -n "${1:-}" ] && echo -n "$1" || echo -n "Continue? (y/n) ")
     yes=$([ -n "${2:-}" ] && echo -n "$2" || echo -n "y")
-    say_noln "$msg"
-    read c && [ "$c" = "$yes" ] && return 0
+    read -p "$msg" c && [ "$c" = "$yes" ] && return 0
     return 1
 }
 
@@ -103,7 +89,7 @@ get_user_confirmation() {
 
 # Get version from the swagger file
 function get_swagger_version {
-    local file=${1:-"$FC_ROOT_DIR/src/api_server/swagger/firecracker.yaml"}
+    local file=${1:-"$FC_ROOT_DIR/src/firecracker/swagger/firecracker.yaml"}
     grep -oP 'version: \K.*' "$file"
 }
 

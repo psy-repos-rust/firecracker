@@ -1,48 +1,45 @@
 // Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
+
 use std::io::{Seek, SeekFrom};
+use std::thread;
 use std::time::Duration;
-use std::{io, thread};
 
-use snapshot::Snapshot;
-use utils::tempfile::TempFile;
-use vmm::builder::{build_microvm_for_boot, build_microvm_from_snapshot, setup_serial_device};
-use vmm::persist::{self, snapshot_state_sanity_check, MicrovmState, MicrovmStateError, VmInfo};
+use vmm::builder::build_and_boot_microvm;
+use vmm::devices::virtio::block::CacheType;
+use vmm::persist::{snapshot_state_sanity_check, MicrovmState, MicrovmStateError, VmInfo};
 use vmm::resources::VmResources;
-use vmm::seccomp_filters::{get_filters, SeccompConfig};
-use vmm::utilities::mock_devices::MockSerialInput;
-use vmm::utilities::mock_resources::{MockVmResources, NOISY_KERNEL_IMAGE};
+use vmm::rpc_interface::{
+    LoadSnapshotError, PrebootApiController, RuntimeApiController, VmmAction, VmmActionError,
+};
+use vmm::seccomp_filters::get_empty_filters;
+use vmm::snapshot::Snapshot;
 #[cfg(target_arch = "x86_64")]
-use vmm::utilities::test_utils::dirty_tracking_vmm;
-use vmm::utilities::test_utils::{create_vmm, default_vmm};
-use vmm::version_map::VERSION_MAP;
-use vmm::vmm_config::instance_info::InstanceInfo;
-use vmm::vmm_config::snapshot::{CreateSnapshotParams, SnapshotType};
-use vmm::{EventManager, FcExitCode};
+use vmm::test_utils::dirty_tracking_vmm;
+use vmm::test_utils::mock_resources::{MockVmResources, NOISY_KERNEL_IMAGE};
+use vmm::test_utils::{create_vmm, default_vmm, default_vmm_no_boot};
+use vmm::vmm_config::balloon::BalloonDeviceConfig;
+use vmm::vmm_config::boot_source::BootSourceConfig;
+use vmm::vmm_config::drive::BlockDeviceConfig;
+use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
+use vmm::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate, VmConfig};
+use vmm::vmm_config::net::NetworkInterfaceConfig;
+use vmm::vmm_config::snapshot::{
+    CreateSnapshotParams, LoadSnapshotParams, MemBackendConfig, MemBackendType, SnapshotType,
+};
+use vmm::vmm_config::vsock::VsockDeviceConfig;
+use vmm::{DumpCpuConfigError, EventManager, FcExitCode};
+use vmm_sys_util::tempfile::TempFile;
 
 #[test]
-fn test_setup_serial_device() {
-    let read_tempfile = TempFile::new().unwrap();
-    let read_handle = MockSerialInput(read_tempfile.into_file());
-    let mut event_manager = EventManager::new().unwrap();
-
-    assert!(setup_serial_device(
-        &mut event_manager,
-        Box::new(read_handle),
-        Box::new(io::stdout()),
-    )
-    .is_ok());
-}
-
-#[test]
-fn test_build_microvm() {
+fn test_build_and_boot_microvm() {
     // Error case: no boot source configured.
     {
         let resources: VmResources = MockVmResources::new().into();
         let mut event_manager = EventManager::new().unwrap();
-        let empty_seccomp_filters = get_filters(SeccompConfig::None).unwrap();
+        let empty_seccomp_filters = get_empty_filters();
 
-        let vmm_ret = build_microvm_for_boot(
+        let vmm_ret = build_and_boot_microvm(
             &InstanceInfo::default(),
             &resources,
             &mut event_manager,
@@ -68,17 +65,40 @@ fn test_build_microvm() {
 }
 
 #[test]
+fn test_build_microvm() {
+    // The built microVM should be in the `VmState::Paused` state here.
+    let (vmm, mut _evtmgr) = default_vmm_no_boot(None);
+    assert_eq!(vmm.lock().unwrap().instance_info().state, VmState::Paused);
+
+    // The microVM should be able to resume and exit successfully.
+    // On x86_64, the vmm should exit once its workload completes and signals the exit event.
+    // On aarch64, the test kernel doesn't exit, so the vmm is force-stopped.
+    vmm.lock().unwrap().resume_vm().unwrap();
+    #[cfg(target_arch = "x86_64")]
+    _evtmgr.run_with_timeout(500).unwrap();
+    #[cfg(target_arch = "aarch64")]
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+    assert_eq!(
+        vmm.lock().unwrap().shutdown_exit_code(),
+        Some(FcExitCode::Ok)
+    );
+}
+
+#[test]
 fn test_pause_resume_microvm() {
     // Tests that pausing and resuming a microVM work as expected.
     let (vmm, _) = default_vmm(None);
 
+    let mut api_controller = RuntimeApiController::new(VmResources::default(), vmm.clone());
+
     // There's a race between this thread and the vcpu thread, but this thread
     // should be able to pause vcpu thread before it finishes running its test-binary.
-    assert!(vmm.lock().unwrap().pause_vm().is_ok());
+    api_controller.handle_request(VmmAction::Pause).unwrap();
     // Pausing again the microVM should not fail (microVM remains in the
     // `Paused` state).
-    assert!(vmm.lock().unwrap().pause_vm().is_ok());
-    assert!(vmm.lock().unwrap().resume_vm().is_ok());
+    api_controller.handle_request(VmmAction::Pause).unwrap();
+    api_controller.handle_request(VmmAction::Resume).unwrap();
+
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
 
@@ -142,17 +162,47 @@ fn test_disallow_snapshots_without_pausing() {
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
 
+#[test]
+fn test_disallow_dump_cpu_config_without_pausing() {
+    let (vmm, _) = default_vmm_no_boot(Some(NOISY_KERNEL_IMAGE));
+
+    // This call should succeed since the microVM is in the paused state before boot.
+    vmm.lock().unwrap().dump_cpu_config().unwrap();
+
+    // Boot the microVM.
+    vmm.lock().unwrap().resume_vm().unwrap();
+
+    // Verify this call is not allowed while running.
+    assert!(matches!(
+        vmm.lock().unwrap().dump_cpu_config(),
+        Err(DumpCpuConfigError::NotAllowed(_))
+    ));
+
+    // Stop the microVM.
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+}
+
 fn verify_create_snapshot(is_diff: bool) -> (TempFile, TempFile) {
     let snapshot_file = TempFile::new().unwrap();
     let memory_file = TempFile::new().unwrap();
 
-    let (vmm, _) = create_vmm(Some(NOISY_KERNEL_IMAGE), is_diff);
+    let (vmm, _) = create_vmm(Some(NOISY_KERNEL_IMAGE), is_diff, true);
+    let resources = VmResources {
+        vm_config: VmConfig {
+            mem_size_mib: 1,
+            track_dirty_pages: is_diff,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let vm_info = VmInfo::from(&resources);
+    let mut controller = RuntimeApiController::new(resources, vmm.clone());
 
     // Be sure that the microVM is running.
     thread::sleep(Duration::from_millis(200));
 
     // Pause microVM.
-    vmm.lock().unwrap().pause_vm().unwrap();
+    controller.handle_request(VmmAction::Pause).unwrap();
 
     // Create snapshot.
     let snapshot_type = match is_diff {
@@ -163,23 +213,11 @@ fn verify_create_snapshot(is_diff: bool) -> (TempFile, TempFile) {
         snapshot_type,
         snapshot_path: snapshot_file.as_path().to_path_buf(),
         mem_file_path: memory_file.as_path().to_path_buf(),
-        version: Some(String::from("0.24.0")),
-    };
-    let vm_info = VmInfo {
-        mem_size_mib: 1u64,
-        ..Default::default()
     };
 
-    {
-        let mut locked_vmm = vmm.lock().unwrap();
-        persist::create_snapshot(
-            &mut locked_vmm,
-            &vm_info,
-            &snapshot_params,
-            VERSION_MAP.clone(),
-        )
+    controller
+        .handle_request(VmmAction::CreateSnapshot(snapshot_params))
         .unwrap();
-    }
 
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 
@@ -187,12 +225,8 @@ fn verify_create_snapshot(is_diff: bool) -> (TempFile, TempFile) {
     let snapshot_path = snapshot_file.as_path().to_path_buf();
     let snapshot_file_metadata = std::fs::metadata(snapshot_path).unwrap();
     let snapshot_len = snapshot_file_metadata.len() as usize;
-    let restored_microvm_state: MicrovmState = Snapshot::load(
-        &mut snapshot_file.as_file(),
-        snapshot_len,
-        VERSION_MAP.clone(),
-    )
-    .unwrap();
+    let (restored_microvm_state, _) =
+        Snapshot::load::<_, MicrovmState>(&mut snapshot_file.as_file(), snapshot_len).unwrap();
 
     assert_eq!(restored_microvm_state.vm_info, vm_info);
 
@@ -207,44 +241,32 @@ fn verify_create_snapshot(is_diff: bool) -> (TempFile, TempFile) {
 }
 
 fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
-    use utils::vm_memory::GuestMemoryMmap;
-    use vmm::memory_snapshot::SnapshotMemory;
-
     let mut event_manager = EventManager::new().unwrap();
-    let empty_seccomp_filters = get_filters(SeccompConfig::None).unwrap();
+    let empty_seccomp_filters = get_empty_filters();
+    let mut vm_resources = VmResources::default();
 
-    // Deserialize microVM state.
-    let snapshot_file_metadata = snapshot_file.as_file().metadata().unwrap();
-    let snapshot_len = snapshot_file_metadata.len() as usize;
-    snapshot_file.as_file().seek(SeekFrom::Start(0)).unwrap();
-    let microvm_state: MicrovmState = Snapshot::load(
-        &mut snapshot_file.as_file(),
-        snapshot_len,
-        VERSION_MAP.clone(),
-    )
-    .unwrap();
-    let mem = GuestMemoryMmap::restore(
-        Some(memory_file.as_file()),
-        &microvm_state.memory_state,
-        false,
-    )
-    .unwrap();
-
-    let vm_resources = &mut VmResources::default();
-
-    // Build microVM from state.
-    let vmm = build_microvm_from_snapshot(
-        &InstanceInfo::default(),
-        &mut event_manager,
-        microvm_state,
-        mem,
-        None,
-        false,
+    let mut preboot_api_controller = PrebootApiController::new(
         &empty_seccomp_filters,
-        vm_resources,
-    )
-    .unwrap();
-    // For now we're happy we got this far, we don't test what the guest is actually doing.
+        InstanceInfo::default(),
+        &mut vm_resources,
+        &mut event_manager,
+    );
+
+    preboot_api_controller
+        .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
+            snapshot_path: snapshot_file.as_path().to_path_buf(),
+            mem_backend: MemBackendConfig {
+                backend_path: memory_file.as_path().to_path_buf(),
+                backend_type: MemBackendType::File,
+            },
+            enable_diff_snapshots: false,
+            resume_vm: true,
+        }))
+        .unwrap();
+
+    let vmm = preboot_api_controller.built_vmm.take().unwrap();
+
+    assert_eq!(vmm.lock().unwrap().instance_info.state, VmState::Running);
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
 
@@ -270,11 +292,10 @@ fn test_create_and_load_snapshot() {
 #[test]
 fn test_snapshot_load_sanity_checks() {
     use vmm::persist::SnapShotStateSanityCheckError;
-    use vmm::vmm_config::machine_config::MAX_SUPPORTED_VCPUS;
 
     let mut microvm_state = get_microvm_state_from_snapshot();
 
-    assert!(snapshot_state_sanity_check(&microvm_state).is_ok());
+    snapshot_state_sanity_check(&microvm_state).unwrap();
 
     // Remove memory regions.
     microvm_state.memory_state.regions.clear();
@@ -283,33 +304,6 @@ fn test_snapshot_load_sanity_checks() {
     assert_eq!(
         snapshot_state_sanity_check(&microvm_state),
         Err(SnapShotStateSanityCheckError::NoMemory)
-    );
-
-    // Create MAX_SUPPORTED_VCPUS vCPUs starting from 1 vCPU.
-    for _ in 0..f64::from(MAX_SUPPORTED_VCPUS).log2() as usize {
-        microvm_state
-            .vcpu_states
-            .append(&mut microvm_state.vcpu_states.clone());
-    }
-
-    // After this line we will have 33 vCPUs, FC max si 32.
-    microvm_state
-        .vcpu_states
-        .push(microvm_state.vcpu_states[0].clone());
-
-    // Validate sanity checks fail because there are too many vCPUs.
-    assert_eq!(
-        snapshot_state_sanity_check(&microvm_state),
-        Err(SnapShotStateSanityCheckError::InvalidVcpuCount)
-    );
-
-    // Remove all vCPUs states from microvm state.
-    microvm_state.vcpu_states.clear();
-
-    // Validate sanity checks fail because there is no vCPU in state.
-    assert_eq!(
-        snapshot_state_sanity_check(&microvm_state),
-        Err(SnapShotStateSanityCheckError::InvalidVcpuCount)
     );
 }
 
@@ -321,147 +315,94 @@ fn get_microvm_state_from_snapshot() -> MicrovmState {
     let snapshot_file_metadata = snapshot_file.as_file().metadata().unwrap();
     let snapshot_len = snapshot_file_metadata.len() as usize;
     snapshot_file.as_file().seek(SeekFrom::Start(0)).unwrap();
-    Snapshot::load(
-        &mut snapshot_file.as_file(),
-        snapshot_len,
-        VERSION_MAP.clone(),
-    )
-    .unwrap()
+    let (state, _) = Snapshot::load(&mut snapshot_file.as_file(), snapshot_len).unwrap();
+    state
 }
 
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn test_snapshot_cpu_vendor() {
-    use vmm::persist::validate_cpu_vendor;
-    let microvm_state = get_microvm_state_from_snapshot();
+fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &str) {
+    let (snapshot_file, memory_file) = verify_create_snapshot(false);
 
-    // Check if the snapshot created above passes validation since
-    // the snapshot was created locally.
-    assert!(validate_cpu_vendor(&microvm_state).is_ok());
-}
+    let mut event_manager = EventManager::new().unwrap();
+    let empty_seccomp_filters = get_empty_filters();
+    let mut vm_resources = VmResources::default();
 
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn test_snapshot_cpu_vendor_mismatch() {
-    use vmm::persist::validate_cpu_vendor;
-    let mut microvm_state = get_microvm_state_from_snapshot();
+    let mut preboot_api_controller = PrebootApiController::new(
+        &empty_seccomp_filters,
+        InstanceInfo::default(),
+        &mut vm_resources,
+        &mut event_manager,
+    );
 
-    // Check if the snapshot created above passes validation since
-    // the snapshot was created locally.
-    assert_eq!(validate_cpu_vendor(&microvm_state), Ok(true));
+    preboot_api_controller.handle_preboot_request(res).unwrap();
 
-    // Modify the vendor id in CPUID.
-    for entry in microvm_state.vcpu_states[0].cpuid.as_mut_slice().iter_mut() {
-        if entry.function == 0 && entry.index == 0 {
-            // Fail if vendor id is NULL as this needs furhter investigation.
-            assert_ne!(entry.ebx, 0);
-            assert_ne!(entry.ecx, 0);
-            assert_ne!(entry.edx, 0);
-            entry.ebx = 0;
-            break;
-        }
-    }
-
-    // It succeeds in checking if the CPU vendor is valid, in this process it discovers the CPU
-    // vendor not valid.
-    assert_eq!(validate_cpu_vendor(&microvm_state), Ok(false));
-
-    // Negative test: remove the vendor id from cpuid.
-    for entry in microvm_state.vcpu_states[0].cpuid.as_mut_slice().iter_mut() {
-        if entry.function == 0 && entry.index == 0 {
-            entry.function = 1234;
-        }
-    }
-
-    // It succeeds in checking if the CPU vendor is valid, in this process it discovers the CPU
-    // vendor not valid.
-    assert_eq!(
-        validate_cpu_vendor(&microvm_state),
-        Err(vmm::persist::ValidateCpuVendorError::Snapshot(
-            vmm::cpuid::common::Error::NotSupported
-        ))
+    // Load snapshot should no longer be allowed.
+    let req = VmmAction::LoadSnapshot(LoadSnapshotParams {
+        snapshot_path: snapshot_file.as_path().to_path_buf(),
+        mem_backend: MemBackendConfig {
+            backend_path: memory_file.as_path().to_path_buf(),
+            backend_type: MemBackendType::File,
+        },
+        enable_diff_snapshots: false,
+        resume_vm: false,
+    });
+    let err = preboot_api_controller.handle_preboot_request(req);
+    assert!(
+        matches!(
+            err.unwrap_err(),
+            VmmActionError::LoadSnapshot(LoadSnapshotError::LoadSnapshotNotAllowed)
+        ),
+        "LoadSnapshot should be disallowed after {}",
+        res_name
     );
 }
 
-#[cfg(target_arch = "x86_64")]
 #[test]
-fn test_snapshot_cpu_vendor_missing() {
-    use vmm::persist::validate_cpu_vendor;
-    let mut microvm_state = get_microvm_state_from_snapshot();
+fn test_preboot_load_snap_disallowed_after_boot_resources() {
+    let tmp_file = TempFile::new().unwrap();
+    let tmp_file = tmp_file.as_path().to_str().unwrap().to_string();
+    // Verify LoadSnapshot not allowed after configuring various boot-specific resources.
+    let req = VmmAction::ConfigureBootSource(BootSourceConfig {
+        kernel_image_path: tmp_file.clone(),
+        ..Default::default()
+    });
+    verify_load_snap_disallowed_after_boot_resources(req, "ConfigureBootSource");
 
-    // Check if the snapshot created above passes validation since
-    // the snapshot was created locally.
-    assert!(validate_cpu_vendor(&microvm_state).is_ok());
+    let config = BlockDeviceConfig {
+        drive_id: String::new(),
+        partuuid: None,
+        is_root_device: false,
+        cache_type: CacheType::Unsafe,
 
-    // Negative test: remove the vendor id from cpuid.
-    for entry in microvm_state.vcpu_states[0].cpuid.as_mut_slice().iter_mut() {
-        if entry.function == 0 && entry.index == 0 {
-            entry.function = 1234;
-        }
-    }
+        is_read_only: Some(false),
+        path_on_host: Some(tmp_file),
+        rate_limiter: None,
+        file_engine_type: None,
 
-    // This must fail as the cpu vendor entry does not exist.
-    assert!(validate_cpu_vendor(&microvm_state).is_err());
-}
+        socket: None,
+    };
 
-#[cfg(target_arch = "aarch64")]
-#[test]
-fn test_snapshot_cpu_vendor() {
-    use vmm::persist::validate_cpu_manufacturer_id;
+    let req = VmmAction::InsertBlockDevice(config);
+    verify_load_snap_disallowed_after_boot_resources(req, "InsertBlockDevice");
 
-    let microvm_state = get_microvm_state_from_snapshot();
+    let req = VmmAction::InsertNetworkDevice(NetworkInterfaceConfig {
+        iface_id: String::new(),
+        host_dev_name: String::new(),
+        guest_mac: None,
+        rx_rate_limiter: None,
+        tx_rate_limiter: None,
+    });
+    verify_load_snap_disallowed_after_boot_resources(req, "InsertNetworkDevice");
 
-    // Check if the snapshot created above passes validation since
-    // the snapshot was created locally.
-    assert!(validate_cpu_manufacturer_id(&microvm_state).is_ok());
-}
+    let req = VmmAction::SetBalloonDevice(BalloonDeviceConfig::default());
+    verify_load_snap_disallowed_after_boot_resources(req, "SetBalloonDevice");
 
-#[cfg(target_arch = "aarch64")]
-#[test]
-fn test_snapshot_cpu_vendor_missing() {
-    use vmm::arch::regs::MIDR_EL1;
-    use vmm::persist::{validate_cpu_manufacturer_id, ValidateCpuManufacturerIdError};
+    let req = VmmAction::SetVsockDevice(VsockDeviceConfig {
+        vsock_id: Some(String::new()),
+        guest_cid: 0,
+        uds_path: String::new(),
+    });
+    verify_load_snap_disallowed_after_boot_resources(req, "SetVsockDevice");
 
-    let mut microvm_state = get_microvm_state_from_snapshot();
-
-    // Check if the snapshot created above passes validation since
-    // the snapshot was created locally.
-    assert_eq!(validate_cpu_manufacturer_id(&microvm_state), Ok(true));
-
-    // Remove the MIDR_EL1 value from the VCPU states, by setting it to 0
-    for state in microvm_state.vcpu_states.as_mut_slice().iter_mut() {
-        for reg in state.regs.as_mut_slice().iter_mut() {
-            if reg.id == MIDR_EL1 {
-                reg.id = 0;
-            }
-        }
-    }
-    assert!(matches!(
-        validate_cpu_manufacturer_id(&microvm_state),
-        Err(ValidateCpuManufacturerIdError::Snapshot(_))
-    ));
-}
-
-#[cfg(target_arch = "aarch64")]
-#[test]
-fn test_snapshot_cpu_vendor_mismatch() {
-    use vmm::arch::regs::MIDR_EL1;
-    use vmm::persist::validate_cpu_manufacturer_id;
-
-    let mut microvm_state = get_microvm_state_from_snapshot();
-
-    // Check if the snapshot created above passes validation since
-    // the snapshot was created locally.
-    assert_eq!(validate_cpu_manufacturer_id(&microvm_state), Ok(true));
-
-    // Change the MIDR_EL1 value from the VCPU states, to contain an
-    // invalid manufacturer ID
-    for state in microvm_state.vcpu_states.as_mut_slice().iter_mut() {
-        for reg in state.regs.as_mut_slice().iter_mut() {
-            if reg.id == MIDR_EL1 {
-                reg.value = 0x710FD081;
-            }
-        }
-    }
-    assert_eq!(validate_cpu_manufacturer_id(&microvm_state), Ok(false));
+    let req = VmmAction::UpdateVmConfiguration(MachineConfigUpdate::from(MachineConfig::default()));
+    verify_load_snap_disallowed_after_boot_resources(req, "SetVmConfiguration");
 }

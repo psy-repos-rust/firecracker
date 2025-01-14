@@ -5,13 +5,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-use std::{fmt, mem};
+use std::mem;
 
 use kvm_bindings::{kvm_fpu, kvm_regs, kvm_sregs};
 use kvm_ioctls::VcpuFd;
-use utils::vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use super::gdt::{gdt_entry, kvm_segment_from_gdt};
+use crate::vstate::memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 // Initial pagetables.
 const PML4_START: u64 = 0x9000;
@@ -19,47 +19,32 @@ const PDPTE_START: u64 = 0xa000;
 const PDE_START: u64 = 0xb000;
 
 /// Errors thrown while setting up x86_64 registers.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum Error {
-    /// Failed to get SREGs for this CPU.
-    #[error("Failed to get SREGs for this CPU: {0}")]
+#[derive(Debug, thiserror::Error, displaydoc::Display, PartialEq, Eq)]
+pub enum RegsError {
+    /// Failed to get SREGs for this CPU: {0}
     GetStatusRegisters(kvm_ioctls::Error),
-    /// Failed to set base registers for this CPU.
-    #[error("Failed to set base registers for this CPU: {0}")]
+    /// Failed to set base registers for this CPU: {0}
     SetBaseRegisters(kvm_ioctls::Error),
-    /// Failed to configure the FPU.
-    #[error("Failed to configure the FPU: {0}")]
+    /// Failed to configure the FPU: {0}
     SetFPURegisters(kvm_ioctls::Error),
-    /// Failed to set SREGs for this CPU.
-    #[error("Failed to set SREGs for this CPU: {0}")]
+    /// Failed to set SREGs for this CPU: {0}
     SetStatusRegisters(kvm_ioctls::Error),
     /// Writing the GDT to RAM failed.
-    #[error("Writing the GDT to RAM failed.")]
     WriteGDT,
-    /// Writing the IDT to RAM failed.
-    #[error("Writing the IDT to RAM failed")]
+    /// Writing the IDT to RAM failed
     WriteIDT,
-    /// Writing PDPTE to RAM failed.
-    #[error("WritePDPTEAddress")]
+    /// WritePDPTEAddress
     WritePDPTEAddress,
-    /// Writing PDE to RAM failed.
-    #[error("WritePDEAddress")]
+    /// WritePDEAddress
     WritePDEAddress,
-    /// Writing PML4 to RAM failed.
-    #[error("WritePML4Address")]
+    /// WritePML4Address
     WritePML4Address,
 }
-type Result<T> = std::result::Result<T, Error>;
 
 /// Error type for [`setup_fpu`].
-#[derive(Debug, derive_more::From, PartialEq, Eq)]
-pub struct SetupFpuError(utils::errno::Error);
-impl std::error::Error for SetupFpuError {}
-impl fmt::Display for SetupFpuError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Failed to setup FPU: {}", self.0)
-    }
-}
+#[derive(Debug, derive_more::From, PartialEq, Eq, thiserror::Error)]
+#[error("Failed to setup FPU: {0}")]
+pub struct SetupFpuError(vmm_sys_util::errno::Error);
 
 /// Configure Floating-Point Unit (FPU) registers for a given CPU.
 ///
@@ -70,7 +55,7 @@ impl fmt::Display for SetupFpuError {
 /// # Errors
 ///
 /// When [`kvm_ioctls::ioctls::vcpu::VcpuFd::set_fpu`] errors.
-pub fn setup_fpu(vcpu: &VcpuFd) -> std::result::Result<(), SetupFpuError> {
+pub fn setup_fpu(vcpu: &VcpuFd) -> Result<(), SetupFpuError> {
     let fpu: kvm_fpu = kvm_fpu {
         fcw: 0x37f,
         mxcsr: 0x1f80,
@@ -81,14 +66,9 @@ pub fn setup_fpu(vcpu: &VcpuFd) -> std::result::Result<(), SetupFpuError> {
 }
 
 /// Error type of [`setup_regs`].
-#[derive(Debug, derive_more::From, PartialEq, Eq)]
-pub struct SetupRegistersError(utils::errno::Error);
-impl std::error::Error for SetupRegistersError {}
-impl fmt::Display for SetupRegistersError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Failed to setup registers:{}", self.0)
-    }
-}
+#[derive(Debug, derive_more::From, PartialEq, Eq, thiserror::Error)]
+#[error("Failed to setup registers: {0}")]
+pub struct SetupRegistersError(vmm_sys_util::errno::Error);
 
 /// Configure base registers for a given CPU.
 ///
@@ -100,7 +80,7 @@ impl fmt::Display for SetupRegistersError {
 /// # Errors
 ///
 /// When [`kvm_ioctls::ioctls::vcpu::VcpuFd::set_regs`] errors.
-pub fn setup_regs(vcpu: &VcpuFd, boot_ip: u64) -> std::result::Result<(), SetupRegistersError> {
+pub fn setup_regs(vcpu: &VcpuFd, boot_ip: u64) -> Result<(), SetupRegistersError> {
     let regs: kvm_regs = kvm_regs {
         rflags: 0x0000_0000_0000_0002u64,
         rip: boot_ip,
@@ -120,20 +100,16 @@ pub fn setup_regs(vcpu: &VcpuFd, boot_ip: u64) -> std::result::Result<(), SetupR
 }
 
 /// Error type for [`setup_sregs`].
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error, displaydoc::Display, PartialEq, Eq)]
 pub enum SetupSpecialRegistersError {
-    /// Failed to get special registers
-    #[error("Failed to get special registers: {0}")]
-    GetSpecialRegisters(utils::errno::Error),
-    /// Failed to configure segments and special registers
-    #[error("Failed to configure segments and special registers: {0}")]
-    ConfigureSegmentsAndSpecialRegisters(Error),
-    /// Failed to setup page tables
-    #[error("Failed to setup page tables: {0}")]
-    SetupPageTables(Error),
-    /// Failed to set special registers
-    #[error("Failed to set special registers: {0}")]
-    SetSpecialRegisters(utils::errno::Error),
+    /// Failed to get special registers: {0}
+    GetSpecialRegisters(vmm_sys_util::errno::Error),
+    /// Failed to configure segments and special registers: {0}
+    ConfigureSegmentsAndSpecialRegisters(RegsError),
+    /// Failed to setup page tables: {0}
+    SetupPageTables(RegsError),
+    /// Failed to set special registers: {0}
+    SetSpecialRegisters(vmm_sys_util::errno::Error),
 }
 
 /// Configures the special registers and system page tables for a given CPU.
@@ -150,10 +126,7 @@ pub enum SetupSpecialRegistersError {
 /// - [`configure_segments_and_sregs`] errors.
 /// - [`setup_page_tables`] errors
 /// - [`kvm_ioctls::ioctls::vcpu::VcpuFd::set_sregs`] errors.
-pub fn setup_sregs(
-    mem: &GuestMemoryMmap,
-    vcpu: &VcpuFd,
-) -> std::result::Result<(), SetupSpecialRegistersError> {
+pub fn setup_sregs(mem: &GuestMemoryMmap, vcpu: &VcpuFd) -> Result<(), SetupSpecialRegistersError> {
     let mut sregs: kvm_sregs = vcpu
         .get_sregs()
         .map_err(SetupSpecialRegistersError::GetSpecialRegisters)?;
@@ -178,27 +151,30 @@ const X86_CR0_PE: u64 = 0x1;
 const X86_CR0_PG: u64 = 0x8000_0000;
 const X86_CR4_PAE: u64 = 0x20;
 
-fn write_gdt_table(table: &[u64], guest_mem: &GuestMemoryMmap) -> Result<()> {
+fn write_gdt_table(table: &[u64], guest_mem: &GuestMemoryMmap) -> Result<(), RegsError> {
     let boot_gdt_addr = GuestAddress(BOOT_GDT_OFFSET);
     for (index, entry) in table.iter().enumerate() {
         let addr = guest_mem
             .checked_offset(boot_gdt_addr, index * mem::size_of::<u64>())
-            .ok_or(Error::WriteGDT)?;
+            .ok_or(RegsError::WriteGDT)?;
         guest_mem
             .write_obj(*entry, addr)
-            .map_err(|_| Error::WriteGDT)?;
+            .map_err(|_| RegsError::WriteGDT)?;
     }
     Ok(())
 }
 
-fn write_idt_value(val: u64, guest_mem: &GuestMemoryMmap) -> Result<()> {
+fn write_idt_value(val: u64, guest_mem: &GuestMemoryMmap) -> Result<(), RegsError> {
     let boot_idt_addr = GuestAddress(BOOT_IDT_OFFSET);
     guest_mem
         .write_obj(val, boot_idt_addr)
-        .map_err(|_| Error::WriteIDT)
+        .map_err(|_| RegsError::WriteIDT)
 }
 
-fn configure_segments_and_sregs(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) -> Result<()> {
+fn configure_segments_and_sregs(
+    mem: &GuestMemoryMmap,
+    sregs: &mut kvm_sregs,
+) -> Result<(), RegsError> {
     let gdt_table: [u64; BOOT_GDT_MAX] = [
         gdt_entry(0, 0, 0),            // NULL
         gdt_entry(0xa09b, 0, 0xfffff), // CODE
@@ -213,11 +189,11 @@ fn configure_segments_and_sregs(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) ->
     // Write segments
     write_gdt_table(&gdt_table[..], mem)?;
     sregs.gdt.base = BOOT_GDT_OFFSET;
-    sregs.gdt.limit = mem::size_of_val(&gdt_table) as u16 - 1;
+    sregs.gdt.limit = u16::try_from(mem::size_of_val(&gdt_table)).unwrap() - 1;
 
     write_idt_value(0, mem)?;
     sregs.idt.base = BOOT_IDT_OFFSET;
-    sregs.idt.limit = mem::size_of::<u64>() as u16 - 1;
+    sregs.idt.limit = u16::try_from(mem::size_of::<u64>()).unwrap() - 1;
 
     sregs.cs = code_seg;
     sregs.ds = data_seg;
@@ -234,7 +210,7 @@ fn configure_segments_and_sregs(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) ->
     Ok(())
 }
 
-fn setup_page_tables(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) -> Result<()> {
+fn setup_page_tables(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) -> Result<(), RegsError> {
     // Puts PML4 right after zero page but aligned to 4k.
     let boot_pml4_addr = GuestAddress(PML4_START);
     let boot_pdpte_addr = GuestAddress(PDPTE_START);
@@ -242,16 +218,16 @@ fn setup_page_tables(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) -> Result<()>
 
     // Entry covering VA [0..512GB)
     mem.write_obj(boot_pdpte_addr.raw_value() | 0x03, boot_pml4_addr)
-        .map_err(|_| Error::WritePML4Address)?;
+        .map_err(|_| RegsError::WritePML4Address)?;
 
     // Entry covering VA [0..1GB)
     mem.write_obj(boot_pde_addr.raw_value() | 0x03, boot_pdpte_addr)
-        .map_err(|_| Error::WritePDPTEAddress)?;
+        .map_err(|_| RegsError::WritePDPTEAddress)?;
     // 512 2MB entries together covering VA [0..1GB). Note we are assuming
     // CPU supports 2MB pages (/proc/cpuinfo has 'pse'). All modern CPUs do.
     for i in 0..512 {
         mem.write_obj((i << 21) + 0x83u64, boot_pde_addr.unchecked_add(i * 8))
-            .map_err(|_| Error::WritePDEAddress)?;
+            .map_err(|_| RegsError::WritePDEAddress)?;
     }
 
     sregs.cr3 = boot_pml4_addr.raw_value();
@@ -262,28 +238,13 @@ fn setup_page_tables(mem: &GuestMemoryMmap, sregs: &mut kvm_sregs) -> Result<()>
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::cast_possible_truncation)]
+
     use kvm_ioctls::Kvm;
-    use utils::vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
     use super::*;
-
-    fn create_guest_mem(mem_size: Option<u64>) -> GuestMemoryMmap {
-        let page_size = 0x10000usize;
-        let mem_size = mem_size.unwrap_or(page_size as u64) as usize;
-        if mem_size % page_size == 0 {
-            utils::vm_memory::test_utils::create_anon_guest_memory(
-                &[(GuestAddress(0), mem_size)],
-                false,
-            )
-            .unwrap()
-        } else {
-            utils::vm_memory::test_utils::create_guest_memory_unguarded(
-                &[(GuestAddress(0), mem_size)],
-                false,
-            )
-            .unwrap()
-        }
-    }
+    use crate::test_utils::single_region_mem;
+    use crate::vstate::memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
     fn read_u64(gm: &GuestMemoryMmap, offset: u64) -> u64 {
         let read_addr = GuestAddress(offset);
@@ -370,9 +331,9 @@ mod tests {
         let kvm = Kvm::new().unwrap();
         let vm = kvm.create_vm().unwrap();
         let vcpu = vm.create_vcpu(0).unwrap();
-        let gm = create_guest_mem(None);
+        let gm = single_region_mem(0x10000);
 
-        assert!(vcpu.set_sregs(&Default::default()).is_ok());
+        vcpu.set_sregs(&Default::default()).unwrap();
         setup_sregs(&gm, &vcpu).unwrap();
 
         let mut sregs: kvm_sregs = vcpu.get_sregs().unwrap();
@@ -387,19 +348,18 @@ mod tests {
     #[test]
     fn test_write_gdt_table() {
         // Not enough memory for the gdt table to be written.
-        let gm = create_guest_mem(Some(BOOT_GDT_OFFSET));
+        let gm = single_region_mem(BOOT_GDT_OFFSET as usize);
         let gdt_table: [u64; BOOT_GDT_MAX] = [
             gdt_entry(0, 0, 0),            // NULL
             gdt_entry(0xa09b, 0, 0xfffff), // CODE
             gdt_entry(0xc093, 0, 0xfffff), // DATA
             gdt_entry(0x808b, 0, 0xfffff), // TSS
         ];
-        assert!(write_gdt_table(&gdt_table, &gm).is_err());
+        write_gdt_table(&gdt_table, &gm).unwrap_err();
 
         // We allocate exactly the amount needed to write four u64 to `BOOT_GDT_OFFSET`.
-        let gm = create_guest_mem(Some(
-            BOOT_GDT_OFFSET + (mem::size_of::<u64>() * BOOT_GDT_MAX) as u64,
-        ));
+        let gm =
+            single_region_mem(BOOT_GDT_OFFSET as usize + (mem::size_of::<u64>() * BOOT_GDT_MAX));
 
         let gdt_table: [u64; BOOT_GDT_MAX] = [
             gdt_entry(0, 0, 0),            // NULL
@@ -407,25 +367,25 @@ mod tests {
             gdt_entry(0xc093, 0, 0xfffff), // DATA
             gdt_entry(0x808b, 0, 0xfffff), // TSS
         ];
-        assert!(write_gdt_table(&gdt_table, &gm).is_ok());
+        write_gdt_table(&gdt_table, &gm).unwrap();
     }
 
     #[test]
     fn test_write_idt_table() {
         // Not enough memory for the a u64 value to fit.
-        let gm = create_guest_mem(Some(BOOT_IDT_OFFSET));
+        let gm = single_region_mem(BOOT_IDT_OFFSET as usize);
         let val = 0x100;
-        assert!(write_idt_value(val, &gm).is_err());
+        write_idt_value(val, &gm).unwrap_err();
 
-        let gm = create_guest_mem(Some(BOOT_IDT_OFFSET + mem::size_of::<u64>() as u64));
+        let gm = single_region_mem(BOOT_IDT_OFFSET as usize + mem::size_of::<u64>());
         // We have allocated exactly the amount neded to write an u64 to `BOOT_IDT_OFFSET`.
-        assert!(write_idt_value(val, &gm).is_ok());
+        write_idt_value(val, &gm).unwrap();
     }
 
     #[test]
     fn test_configure_segments_and_sregs() {
         let mut sregs: kvm_sregs = Default::default();
-        let gm = create_guest_mem(None);
+        let gm = single_region_mem(0x10000);
         configure_segments_and_sregs(&gm, &mut sregs).unwrap();
 
         validate_segments_and_sregs(&gm, &sregs);
@@ -434,16 +394,16 @@ mod tests {
     #[test]
     fn test_setup_page_tables() {
         let mut sregs: kvm_sregs = Default::default();
-        let gm = create_guest_mem(Some(PML4_START));
-        assert!(setup_page_tables(&gm, &mut sregs).is_err());
+        let gm = single_region_mem(PML4_START as usize);
+        setup_page_tables(&gm, &mut sregs).unwrap_err();
 
-        let gm = create_guest_mem(Some(PDPTE_START));
-        assert!(setup_page_tables(&gm, &mut sregs).is_err());
+        let gm = single_region_mem(PDPTE_START as usize);
+        setup_page_tables(&gm, &mut sregs).unwrap_err();
 
-        let gm = create_guest_mem(Some(PDE_START));
-        assert!(setup_page_tables(&gm, &mut sregs).is_err());
+        let gm = single_region_mem(PDE_START as usize);
+        setup_page_tables(&gm, &mut sregs).unwrap_err();
 
-        let gm = create_guest_mem(None);
+        let gm = single_region_mem(0x10000);
         setup_page_tables(&gm, &mut sregs).unwrap();
 
         validate_page_tables(&gm, &sregs);

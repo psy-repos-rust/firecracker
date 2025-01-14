@@ -4,6 +4,10 @@
         "filter_action": "allow",
         "filter": [
             {
+                "syscall": "newfstatat",
+                "comment": "Used when creating snapshots in vmm:persist::snapshot_memory_to_file through std::fs::File::metadata"
+            },
+            {
                 "syscall": "epoll_ctl"
             },
             {
@@ -29,14 +33,14 @@
                 "comment": "Used by the VirtIO net device to write to tap"
             },
             {
+                "syscall": "readv",
+                "comment": "Used by the VirtIO net device to read from tap"
+            },
+            {
                 "syscall": "fsync"
             },
             {
                 "syscall": "close"
-            },
-            {
-                "syscall": "uname",
-                "comment": "Used for getting the kernel version, for validating io_uring support"
             },
             {
                 "syscall": "eventfd2",
@@ -71,6 +75,10 @@
                 "comment": "Used for drive patching & rescanning, for reading the local timezone from /etc/localtime"
             },
             {
+                "syscall": "faccessat",
+                "comment": "Used by aws-lc-sys"
+            },
+            {
                 "syscall": "ftruncate",
                 "comment": "Used for snapshotting"
             },
@@ -101,6 +109,10 @@
             {
                 "syscall": "sigaltstack",
                 "comment": "sigaltstack is used by Rust stdlib to remove alternative signal stack during thread teardown."
+            },
+            {
+              "syscall": "getrandom",
+              "comment": "getrandom is used by aws-lc library which we consume in virtio-rng"
             },
             {
                 "syscall": "accept4",
@@ -202,16 +214,7 @@
             },
             {
                 "syscall": "madvise",
-                "comment": "Used by the VirtIO balloon device and by musl for some customer workloads",
-                "args": [
-                    {
-                        "index": 2,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 4,
-                        "comment": "libc::MADV_DONTNEED"
-                    }
-                ]
+                "comment": "Used by the VirtIO balloon device and by musl for some customer workloads. It is also used by aws-lc during random number generation. They setup a memory page that mark with MADV_WIPEONFORK to be able to detect forks. They also call it with -1 to see if madvise is supported in certain platforms." 
             },
             {
                 "syscall": "mmap",
@@ -433,6 +436,14 @@
             {
                 "syscall": "sched_yield",
                 "comment": "Used by the rust standard library in std::sync::mpmc. Firecracker uses mpsc channels from this module for inter-thread communication"
+            },
+            {
+                "syscall": "sendmsg",
+                "comment": "Used by vhost-user frontend to communicate with the backend"
+            },
+            {
+                "syscall": "recvmsg",
+                "comment": "Used by vhost-user frontend to read response from the backend"
             }
         ]
     },
@@ -499,6 +510,10 @@
             {
                 "syscall": "sigaltstack",
                 "comment": "sigaltstack is used by Rust stdlib to remove alternative signal stack during thread teardown."
+            },
+            {
+              "syscall": "getrandom",
+              "comment": "getrandom is used by `HttpServer` to reinialize `HashMap` after moving to the API thread"
             },
             {
                 "syscall": "accept4",
@@ -601,6 +616,19 @@
                         "op": "eq",
                         "val": 4,
                         "comment": "libc::MADV_DONTNEED"
+                    }
+                ]
+            },
+            {
+                "syscall": "madvise",
+                "comment": "Triggered on some deallocation paths in musl free()",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 8,
+                        "comment": "libc::MADV_FREE"
                     }
                 ]
             },
@@ -831,6 +859,19 @@
                 ]
             },
             {
+                "syscall": "madvise",
+                "comment": "Triggered on some deallocation paths in musl free()",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 8,
+                        "comment": "libc::MADV_FREE"
+                    }
+                ]
+            },
+            {
                 "syscall": "mmap",
                 "comment": "Used for reading the timezone in LocalTime::now()",
                 "args": [
@@ -840,6 +881,26 @@
                         "op": "eq",
                         "val": 1,
                         "comment": "libc::MAP_SHARED"
+                    }
+                ]
+            },
+            {
+                "syscall": "mmap",
+                "comment": "Used for allocating memory for FamStructWrapper called by KvmCpu::get_cpuid",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 34,
+                        "comment": "libc::MAP_ANONYMOUS|libc::MAP_PRIVATE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3,
+                        "comment": "libc::PROT_READ|libc::PROT_WRITE"
                     }
                 ]
             },
@@ -912,56 +973,8 @@
                         "index": 1,
                         "type": "dword",
                         "op": "eq",
-                        "val": 1074048665,
-                        "comment": "KVM_SET_MP_STATE"
-                    }
-                ]
-            },
-            {
-                "syscall": "ioctl",
-                "args": [
-                    {
-                        "index": 1,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 2151722655,
-                        "comment": "KVM_GET_VCPU_EVENTS"
-                    }
-                ]
-            },
-            {
-                "syscall": "ioctl",
-                "args": [
-                    {
-                        "index": 1,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 1077980832,
-                        "comment": "KVM_SET_VCPU_EVENTS"
-                    }
-                ]
-            },
-            {
-                "syscall": "ioctl",
-                "args": [
-                    {
-                        "index": 1,
-                        "type": "dword",
-                        "op": "eq",
                         "val": 1074835115,
                         "comment": "KVM_GET_ONE_REG"
-                    }
-                ]
-            },
-            {
-                "syscall": "ioctl",
-                "args": [
-                    {
-                        "index": 1,
-                        "type": "dword",
-                        "op": "eq",
-                        "val": 1074835116,
-                        "comment": "KVM_SET_ONE_REG"
                     }
                 ]
             },
@@ -978,8 +991,24 @@
                 ]
             },
             {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074025680,
+                        "comment": "TUNSETOFFLOAD"
+                    }
+                ]
+            },
+            {
                 "syscall": "sched_yield",
                 "comment": "Used by the rust standard library in std::sync::mpmc. Firecracker uses mpsc channels from this module for inter-thread communication"
+            },
+            {
+                "syscall": "sendmsg",
+                "comment": "Used by vhost-user frontend to communicate with the backend"
             }
         ]
     }

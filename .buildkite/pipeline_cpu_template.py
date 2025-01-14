@@ -4,10 +4,9 @@
 
 """Generate Buildkite CPU Template pipelines dynamically"""
 
-import argparse
 from enum import Enum
 
-from common import DEFAULT_PLATFORMS, group, pipeline_to_json
+from common import DEFAULT_INSTANCES, DEFAULT_PLATFORMS, BKPipeline, group
 
 
 class BkStep(str, Enum):
@@ -17,23 +16,31 @@ class BkStep(str, Enum):
 
     LABEL = "label"
     TIMEOUT = "timeout"
-    COMMAND = "commands"
+    COMMAND = "command"
     ARTIFACTS = "artifact_paths"
 
 
 cpu_template_test = {
     "rdmsr": {
         BkStep.COMMAND: [
-            "tools/devtool -y test -- -s -ra --nonci --log-cli-level=INFO integration_tests/functional/test_cpu_features.py -k 'test_cpu_rdmsr' "
+            "tools/devtool -y test --no-build -- -m nonci -n4 --dist worksteal integration_tests/functional/test_cpu_features_x86_64.py -k 'test_cpu_rdmsr' "
         ],
         BkStep.LABEL: "📖 rdmsr",
-        "instances": ["m5d.metal", "m6a.metal", "m6i.metal"],
+        "instances": ["c5n.metal", "m5n.metal", "m6a.metal", "m6i.metal"],
+        "platforms": DEFAULT_PLATFORMS,
+    },
+    "fingerprint": {
+        BkStep.COMMAND: [
+            "tools/devtool -y test --no-build -- -m no_block_pr integration_tests/functional/test_cpu_template_helper.py -k test_guest_cpu_config_change",
+        ],
+        BkStep.LABEL: "🖐️ fingerprint",
+        "instances": DEFAULT_INSTANCES,
         "platforms": DEFAULT_PLATFORMS,
     },
     "cpuid_wrmsr": {
         "snapshot": {
             BkStep.COMMAND: [
-                "tools/devtool -y test -- -s -ra --nonci --log-cli-level=INFO integration_tests/functional/test_cpu_features.py -k 'test_cpu_wrmsr_snapshot or test_cpu_cpuid_snapshot'",
+                "tools/devtool -y test --no-build -- -m nonci -n4 --dist worksteal integration_tests/functional/test_cpu_features_x86_64.py -k 'test_cpu_wrmsr_snapshot or test_cpu_cpuid_snapshot'",
                 "mkdir -pv tests/snapshot_artifacts_upload/{instance}_{os}_{kv}",
                 "sudo mv tests/snapshot_artifacts/* tests/snapshot_artifacts_upload/{instance}_{os}_{kv}",
             ],
@@ -45,33 +52,19 @@ cpu_template_test = {
             BkStep.COMMAND: [
                 "buildkite-agent artifact download tests/snapshot_artifacts_upload/{instance}_{os}_{kv}/**/* .",
                 "mv tests/snapshot_artifacts_upload/{instance}_{os}_{kv} tests/snapshot_artifacts",
-                "tools/devtool -y test -- -s -ra --nonci --log-cli-level=INFO integration_tests/functional/test_cpu_features.py -k 'test_cpu_wrmsr_restore or test_cpu_cpuid_restore'",
+                "tools/devtool -y test --no-build -- -m nonci -n4 --dist worksteal integration_tests/functional/test_cpu_features_x86_64.py -k 'test_cpu_wrmsr_restore or test_cpu_cpuid_restore'",
             ],
             BkStep.LABEL: "📸 load snapshot artifacts created on {instance} {snapshot_os} {snapshot_kv} to {restore_instance} {restore_os} {restore_kv}",
             BkStep.TIMEOUT: 30,
         },
         "cross_instances": {
-            "m5d.metal": ["m6i.metal"],
-            "m6i.metal": ["m5d.metal"],
+            "m5n.metal": ["c5n.metal", "m6i.metal"],
+            "c5n.metal": ["m5n.metal", "m6i.metal"],
+            "m6i.metal": ["m5n.metal", "c5n.metal"],
         },
-        "instances": ["m5d.metal", "m6i.metal", "m6a.metal"],
+        "instances": ["c5n.metal", "m5n.metal", "m6i.metal", "m6a.metal"],
     },
 }
-
-
-def group_rdmsr(tests):
-    """
-    Generate a group step with specified parameters for each instance
-    and kernel combination
-    https://buildkite.com/docs/pipelines/group-step
-    """
-    group_step = group(
-        label=tests[BkStep.LABEL],
-        command=tests[BkStep.COMMAND],
-        instances=tests["instances"],
-        platforms=tests["platforms"],
-    )
-    return [group_step]
 
 
 def group_snapshot_restore(test_step):
@@ -124,11 +117,11 @@ def group_snapshot_restore(test_step):
                 BkStep.COMMAND: restore_commands,
                 BkStep.LABEL: restore_label,
                 BkStep.TIMEOUT: test_step["restore"][BkStep.TIMEOUT],
-                "agents": [
-                    f"instance={restore_instance}",
-                    f"kv={restore_kv}",
-                    f"os={restore_os}",
-                ],
+                "agents": {
+                    "instance": restore_instance,
+                    "kv": restore_kv,
+                    "os": restore_os,
+                },
             }
         )
 
@@ -136,28 +129,20 @@ def group_snapshot_restore(test_step):
     return groups
 
 
-def main():
-    """
-    Generate group template required to trigger pipelines for
-    the requested CPU template test.
-    """
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
+if __name__ == "__main__":
+    BKPipeline.parser.add_argument(
         "--test",
-        required=True,
         choices=list(cpu_template_test),
         help="CPU template test",
+        action="append",
     )
-    test_args = parser.parse_args()
-
-    if test_args.test == "rdmsr":
-        test_group = group_rdmsr(cpu_template_test[test_args.test])
-    else:
-        test_group = group_snapshot_restore(cpu_template_test[test_args.test])
-
-    pipeline = {"steps": test_group}
-    print(pipeline_to_json(pipeline))
-
-
-if __name__ == "__main__":
-    main()
+    pipeline = BKPipeline()
+    for test in pipeline.args.test or list(cpu_template_test):
+        if test == "cpuid_wrmsr":
+            groups = group_snapshot_restore(cpu_template_test[test])
+            for grp in groups:
+                pipeline.add_step(grp)
+        else:
+            test_data = cpu_template_test[test]
+            pipeline.build_group(**test_data, artifacts=["./test_results/**/*"])
+    print(pipeline.to_json())

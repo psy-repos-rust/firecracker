@@ -7,7 +7,7 @@ use kvm_bindings::KVM_DEV_ARM_VGIC_GRP_DIST_REGS;
 use kvm_ioctls::DeviceFd;
 
 use crate::arch::aarch64::gic::regs::{GicRegState, MmioReg, SimpleReg, VgicRegEngine};
-use crate::arch::aarch64::gic::Result;
+use crate::arch::aarch64::gic::GicError;
 use crate::arch::{IRQ_BASE, IRQ_MAX};
 
 // Distributor registers as detailed at page 75 from
@@ -30,7 +30,7 @@ const GICD_SPENDSGIR: DistReg = DistReg::simple(0xF20, 16);
 // List with relevant distributor registers that we will be restoring.
 // Order is taken from qemu.
 // Criteria for the present list of registers: only R/W registers, implementation specific registers
-// are not saved. NOTICE: Any changes to this structure require a snapshot version bump.
+// are not saved.
 static VGIC_DIST_REGS: &[DistReg] = &[
     GICD_CTLR,
     GICD_ICENABLER,
@@ -116,11 +116,11 @@ impl VgicRegEngine for DistRegEngine {
     }
 }
 
-pub(crate) fn get_dist_regs(fd: &DeviceFd) -> Result<Vec<GicRegState<u32>>> {
+pub(crate) fn get_dist_regs(fd: &DeviceFd) -> Result<Vec<GicRegState<u32>>, GicError> {
     DistRegEngine::get_regs_data(fd, Box::new(VGIC_DIST_REGS.iter()), 0)
 }
 
-pub(crate) fn set_dist_regs(fd: &DeviceFd, state: &[GicRegState<u32>]) -> Result<()> {
+pub(crate) fn set_dist_regs(fd: &DeviceFd, state: &[GicRegState<u32>]) -> Result<(), GicError> {
     DistRegEngine::set_regs_data(fd, Box::new(VGIC_DIST_REGS.iter()), state, 0)
 }
 
@@ -133,7 +133,7 @@ mod tests {
     use kvm_ioctls::Kvm;
 
     use super::*;
-    use crate::arch::aarch64::gic::{create_gic, Error, GICVersion};
+    use crate::arch::aarch64::gic::{create_gic, GICVersion, GicError};
 
     #[test]
     fn test_access_dist_regs() {
@@ -142,27 +142,28 @@ mod tests {
         let _ = vm.create_vcpu(0).unwrap();
         let gic_fd = match create_gic(&vm, 1, Some(GICVersion::GICV2)) {
             Ok(gic_fd) => gic_fd,
-            Err(Error::CreateGIC(_)) => return,
+            Err(GicError::CreateGIC(_)) => return,
             _ => panic!("Failed to open setup GICv2"),
         };
 
         let res = get_dist_regs(gic_fd.device_fd());
-        assert!(res.is_ok());
         let state = res.unwrap();
         assert_eq!(state.len(), 7);
         // Check GICD_CTLR size.
         assert_eq!(state[0].chunks.len(), 1);
 
         let res = set_dist_regs(gic_fd.device_fd(), &state);
-        assert!(res.is_ok());
+        res.unwrap();
 
         unsafe { libc::close(gic_fd.device_fd().as_raw_fd()) };
 
         let res = get_dist_regs(gic_fd.device_fd());
-        assert!(res.is_err());
         assert_eq!(
             format!("{:?}", res.unwrap_err()),
             "DeviceAttribute(Error(9), false, 1)"
         );
+
+        // dropping gic_fd would double close the gic fd, so leak it
+        std::mem::forget(gic_fd);
     }
 }

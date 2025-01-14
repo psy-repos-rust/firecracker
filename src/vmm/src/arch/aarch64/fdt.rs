@@ -8,17 +8,15 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt::Debug;
-use std::result;
 
-use utils::vm_memory::{
-    Address, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap,
-};
 use vm_fdt::{Error as VmFdtError, FdtWriter, FdtWriterNode};
+use vm_memory::GuestMemoryError;
 
 use super::super::{DeviceType, InitrdConfig};
 use super::cache_info::{read_cache_config, CacheEntry};
-use super::get_fdt_addr;
 use super::gic::GICDevice;
+use crate::devices::acpi::vmgenid::{VmGenId, VMGENID_MEM_SIZE};
+use crate::vstate::memory::{Address, GuestMemory, GuestMemoryMmap};
 
 // This is a value for uniquely identifying the FDT node declaring the interrupt controller.
 const GIC_PHANDLE: u32 = 1;
@@ -27,7 +25,7 @@ const CLOCK_PHANDLE: u32 = 2;
 // You may be wondering why this big value?
 // This phandle is used to uniquely identify the FDT nodes containing cache information. Each cpu
 // can have a variable number of caches, some of these caches may be shared with other cpus.
-// So, we start the indexing of the phandles used from a really big number and then substract from
+// So, we start the indexing of the phandles used from a really big number and then subtract from
 // it as we need more and more phandle for each cache representation.
 const LAST_CACHE_PHANDLE: u32 = 4000;
 // Read the documentation specified when appending the root node to the FDT.
@@ -55,25 +53,26 @@ pub trait DeviceInfoForFDT {
 }
 
 /// Errors thrown while configuring the Flattened Device Tree for aarch64.
-#[derive(Debug, derive_more::From)]
-pub enum Error {
-    CreateFdt(VmFdtError),
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum FdtError {
+    /// Create FDT error: {0}
+    CreateFdt(#[from] VmFdtError),
+    /// Read cache info error: {0}
     ReadCacheInfo(String),
     /// Failure in writing FDT in memory.
-    WriteFdtToMemory(GuestMemoryError),
+    WriteFdtToMemory(#[from] GuestMemoryError),
 }
 
-type Result<T> = result::Result<T, Error>;
-
 /// Creates the flattened device tree for this aarch64 microVM.
-pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug, S: std::hash::BuildHasher>(
+pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     guest_mem: &GuestMemoryMmap,
     vcpu_mpidr: Vec<u64>,
     cmdline: CString,
-    device_info: &HashMap<(DeviceType, String), T, S>,
-    gic_device: &dyn GICDevice,
+    device_info: &HashMap<(DeviceType, String), T>,
+    gic_device: &GICDevice,
+    vmgenid: &Option<VmGenId>,
     initrd: &Option<InitrdConfig>,
-) -> Result<Vec<u8>> {
+) -> Result<Vec<u8>, FdtError> {
     // Allocate stuff necessary for storing the blob.
     let mut fdt_writer = FdtWriter::new()?;
 
@@ -99,21 +98,18 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug, S: std::hash::BuildHasher
     create_clock_node(&mut fdt_writer)?;
     create_psci_node(&mut fdt_writer)?;
     create_devices_node(&mut fdt_writer, device_info)?;
+    create_vmgenid_node(&mut fdt_writer, vmgenid)?;
 
     // End Header node.
     fdt_writer.end_node(root)?;
 
     // Allocate another buffer so we can format and then write fdt to guest.
     let fdt_final = fdt_writer.finish()?;
-
-    // Write FDT to memory.
-    let fdt_address = GuestAddress(get_fdt_addr(guest_mem));
-    guest_mem.write_slice(fdt_final.as_slice(), fdt_address)?;
     Ok(fdt_final)
 }
 
 // Following are the auxiliary function for creating the different nodes that we append to our FDT.
-fn create_cpu_nodes(fdt: &mut FdtWriter, vcpu_mpidr: &[u64]) -> Result<()> {
+fn create_cpu_nodes(fdt: &mut FdtWriter, vcpu_mpidr: &[u64]) -> Result<(), FdtError> {
     // Since the L1 caches are not shareable among CPUs and they are direct attributes of the
     // cpu in the device tree, we process the L1 and non-L1 caches separately.
     // We use sysfs for extracting the cache information.
@@ -121,7 +117,7 @@ fn create_cpu_nodes(fdt: &mut FdtWriter, vcpu_mpidr: &[u64]) -> Result<()> {
     let mut non_l1_caches: Vec<CacheEntry> = Vec::new();
     // We use sysfs for extracting the cache information.
     read_cache_config(&mut l1_caches, &mut non_l1_caches)
-        .map_err(|err| Error::ReadCacheInfo(err.to_string()))?;
+        .map_err(|err| FdtError::ReadCacheInfo(err.to_string()))?;
 
     // See https://github.com/torvalds/linux/blob/master/Documentation/devicetree/bindings/arm/cpus.yaml.
     let cpus = fdt.begin_node("cpus")?;
@@ -145,13 +141,13 @@ fn create_cpu_nodes(fdt: &mut FdtWriter, vcpu_mpidr: &[u64]) -> Result<()> {
             // https://github.com/devicetree-org/devicetree-specification/releases/download/v0.3/devicetree-specification-v0.3.pdf,
             // section 3.8.
             if let Some(size) = cache.size_ {
-                fdt.property_u32(cache.type_.of_cache_size(), size as u32)?;
+                fdt.property_u32(cache.type_.of_cache_size(), size)?;
             }
             if let Some(line_size) = cache.line_size {
                 fdt.property_u32(cache.type_.of_cache_line_size(), u32::from(line_size))?;
             }
             if let Some(number_of_sets) = cache.number_of_sets {
-                fdt.property_u32(cache.type_.of_cache_sets(), u32::from(number_of_sets))?;
+                fdt.property_u32(cache.type_.of_cache_sets(), number_of_sets)?;
             }
         }
 
@@ -172,8 +168,11 @@ fn create_cpu_nodes(fdt: &mut FdtWriter, vcpu_mpidr: &[u64]) -> Result<()> {
             // The operation is safe since we already checked when creating cache attributes that
             // cpus_per_unit is not 0 (.e look for mask_str2bit_count function).
             let cache_phandle = LAST_CACHE_PHANDLE
-                - (num_cpus * (cache.level - 2) as usize + cpu_index / cache.cpus_per_unit as usize)
-                    as u32;
+                - u32::try_from(
+                    num_cpus * (cache.level - 2) as usize
+                        + cpu_index / cache.cpus_per_unit as usize,
+                )
+                .unwrap(); // Safe because the number of CPUs is bounded
 
             if prev_level != cache.level {
                 fdt.property_u32("next-level-cache", cache_phandle)?;
@@ -192,13 +191,13 @@ fn create_cpu_nodes(fdt: &mut FdtWriter, vcpu_mpidr: &[u64]) -> Result<()> {
                 fdt.property_string("compatible", "cache")?;
                 fdt.property_u32("cache-level", u32::from(cache.level))?;
                 if let Some(size) = cache.size_ {
-                    fdt.property_u32(cache.type_.of_cache_size(), size as u32)?;
+                    fdt.property_u32(cache.type_.of_cache_size(), size)?;
                 }
                 if let Some(line_size) = cache.line_size {
                     fdt.property_u32(cache.type_.of_cache_line_size(), u32::from(line_size))?;
                 }
                 if let Some(number_of_sets) = cache.number_of_sets {
-                    fdt.property_u32(cache.type_.of_cache_sets(), u32::from(number_of_sets))?;
+                    fdt.property_u32(cache.type_.of_cache_sets(), number_of_sets)?;
                 }
                 if let Some(cache_type) = cache.type_.of_cache_type() {
                     fdt.property_null(cache_type)?;
@@ -217,13 +216,27 @@ fn create_cpu_nodes(fdt: &mut FdtWriter, vcpu_mpidr: &[u64]) -> Result<()> {
     Ok(())
 }
 
-fn create_memory_node(fdt: &mut FdtWriter, guest_mem: &GuestMemoryMmap) -> Result<()> {
-    let mem_size = guest_mem.last_addr().raw_value() - super::layout::DRAM_MEM_START + 1;
+fn create_memory_node(fdt: &mut FdtWriter, guest_mem: &GuestMemoryMmap) -> Result<(), FdtError> {
     // See https://github.com/torvalds/linux/blob/master/Documentation/devicetree/booting-without-of.txt#L960
     // for an explanation of this.
-    let mem_reg_prop = &[super::layout::DRAM_MEM_START, mem_size];
 
-    let mem = fdt.begin_node("memory")?;
+    // On ARM we reserve some memory so that it can be utilized for devices like VMGenID to send
+    // data to kernel drivers. The range of this memory is:
+    //
+    // [layout::DRAM_MEM_START, layout::DRAM_MEM_START + layout::SYSTEM_MEM_SIZE)
+    //
+    // The reason we do this is that Linux does not allow remapping system memory. However, without
+    // remap, kernel drivers cannot get virtual addresses to read data from device memory. Leaving
+    // this memory region out allows Linux kernel modules to remap and thus read this region.
+    let mem_size = guest_mem.last_addr().raw_value()
+        - super::layout::DRAM_MEM_START
+        - super::layout::SYSTEM_MEM_SIZE
+        + 1;
+    let mem_reg_prop = &[
+        super::layout::DRAM_MEM_START + super::layout::SYSTEM_MEM_SIZE,
+        mem_size,
+    ];
+    let mem = fdt.begin_node("memory@ram")?;
     fdt.property_string("device_type", "memory")?;
     fdt.property_array_u64("reg", mem_reg_prop)?;
     fdt.end_node(mem)?;
@@ -235,7 +248,7 @@ fn create_chosen_node(
     fdt: &mut FdtWriter,
     cmdline: CString,
     initrd: &Option<InitrdConfig>,
-) -> Result<()> {
+) -> Result<(), FdtError> {
     let chosen = fdt.begin_node("chosen")?;
     // Workaround to be able to reuse an existing property_*() method; in property_string() method,
     // the cmdline is reconverted to a CString to be written in memory as a null terminated string.
@@ -257,7 +270,21 @@ fn create_chosen_node(
     Ok(())
 }
 
-fn create_gic_node(fdt: &mut FdtWriter, gic_device: &dyn GICDevice) -> Result<()> {
+fn create_vmgenid_node(fdt: &mut FdtWriter, vmgenid: &Option<VmGenId>) -> Result<(), FdtError> {
+    if let Some(vmgenid_info) = vmgenid {
+        let vmgenid = fdt.begin_node("vmgenid")?;
+        fdt.property_string("compatible", "microsoft,vmgenid")?;
+        fdt.property_array_u64("reg", &[vmgenid_info.guest_address.0, VMGENID_MEM_SIZE])?;
+        fdt.property_array_u32(
+            "interrupts",
+            &[GIC_FDT_IRQ_TYPE_SPI, vmgenid_info.gsi, IRQ_TYPE_EDGE_RISING],
+        )?;
+        fdt.end_node(vmgenid)?;
+    }
+    Ok(())
+}
+
+fn create_gic_node(fdt: &mut FdtWriter, gic_device: &GICDevice) -> Result<(), FdtError> {
     let interrupt = fdt.begin_node("intc")?;
     fdt.property_string("compatible", gic_device.fdt_compatibility())?;
     fdt.property_null("interrupt-controller")?;
@@ -283,7 +310,7 @@ fn create_gic_node(fdt: &mut FdtWriter, gic_device: &dyn GICDevice) -> Result<()
     Ok(())
 }
 
-fn create_clock_node(fdt: &mut FdtWriter) -> Result<()> {
+fn create_clock_node(fdt: &mut FdtWriter) -> Result<(), FdtError> {
     // The Advanced Peripheral Bus (APB) is part of the Advanced Microcontroller Bus Architecture
     // (AMBA) protocol family. It defines a low-cost interface that is optimized for minimal power
     // consumption and reduced interface complexity.
@@ -298,7 +325,7 @@ fn create_clock_node(fdt: &mut FdtWriter) -> Result<()> {
     Ok(())
 }
 
-fn create_timer_node(fdt: &mut FdtWriter) -> Result<()> {
+fn create_timer_node(fdt: &mut FdtWriter) -> Result<(), FdtError> {
     // See
     // https://github.com/torvalds/linux/blob/master/Documentation/devicetree/bindings/interrupt-controller/arch_timer.txt
     // These are fixed interrupt numbers for the timer device.
@@ -320,7 +347,7 @@ fn create_timer_node(fdt: &mut FdtWriter) -> Result<()> {
     Ok(())
 }
 
-fn create_psci_node(fdt: &mut FdtWriter) -> Result<()> {
+fn create_psci_node(fdt: &mut FdtWriter) -> Result<(), FdtError> {
     let compatible = "arm,psci-0.2";
 
     let psci = fdt.begin_node("psci")?;
@@ -337,7 +364,7 @@ fn create_psci_node(fdt: &mut FdtWriter) -> Result<()> {
 fn create_virtio_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt: &mut FdtWriter,
     dev_info: &T,
-) -> Result<()> {
+) -> Result<(), FdtError> {
     let virtio_mmio = fdt.begin_node(&format!("virtio_mmio@{:x}", dev_info.addr()))?;
 
     fdt.property_string("compatible", "virtio,mmio")?;
@@ -355,7 +382,7 @@ fn create_virtio_node<T: DeviceInfoForFDT + Clone + Debug>(
 fn create_serial_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt: &mut FdtWriter,
     dev_info: &T,
-) -> Result<()> {
+) -> Result<(), FdtError> {
     let serial = fdt.begin_node(&format!("uart@{:x}", dev_info.addr()))?;
 
     fdt.property_string("compatible", "ns16550a")?;
@@ -374,7 +401,7 @@ fn create_serial_node<T: DeviceInfoForFDT + Clone + Debug>(
 fn create_rtc_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt: &mut FdtWriter,
     dev_info: &T,
-) -> Result<()> {
+) -> Result<(), FdtError> {
     // Driver requirements:
     // https://elixir.bootlin.com/linux/latest/source/Documentation/devicetree/bindings/rtc/arm,pl031.yaml
     // We do not offer the `interrupt` property because the device
@@ -394,7 +421,7 @@ fn create_rtc_node<T: DeviceInfoForFDT + Clone + Debug>(
 fn create_devices_node<T: DeviceInfoForFDT + Clone + Debug, S: std::hash::BuildHasher>(
     fdt: &mut FdtWriter,
     dev_info: &HashMap<(DeviceType, String), T, S>,
-) -> Result<()> {
+) -> Result<(), FdtError> {
     // Create one temp Vec to store all virtio devices
     let mut ordered_virtio_device: Vec<&T> = Vec::new();
 
@@ -426,7 +453,10 @@ mod tests {
 
     use super::*;
     use crate::arch::aarch64::gic::create_gic;
-    use crate::arch::aarch64::{arch_memory_regions, layout};
+    use crate::arch::aarch64::layout;
+    use crate::device_manager::resources::ResourceAllocator;
+    use crate::test_utils::arch_mem;
+    use crate::vstate::memory::GuestAddress;
 
     const LEN: u64 = 4096;
 
@@ -449,7 +479,7 @@ mod tests {
     }
     // The `load` function from the `device_tree` will mistakenly check the actual size
     // of the buffer with the allocated size. This works around that.
-    fn set_size(buf: &mut [u8], pos: usize, val: usize) {
+    fn set_size(buf: &mut [u8], pos: usize, val: u32) {
         buf[pos] = ((val >> 24) & 0xff) as u8;
         buf[pos + 1] = ((val >> 16) & 0xff) as u8;
         buf[pos + 2] = ((val >> 8) & 0xff) as u8;
@@ -458,9 +488,7 @@ mod tests {
 
     #[test]
     fn test_create_fdt_with_devices() {
-        let regions = arch_memory_regions(layout::FDT_MAX_SIZE + 0x1000);
-        let mem = utils::vm_memory::test_utils::create_anon_guest_memory(&regions, false)
-            .expect("Cannot initialize memory");
+        let mem = arch_mem(layout::FDT_MAX_SIZE + 0x1000);
 
         let dev_info: HashMap<(DeviceType, std::string::String), MMIODeviceInfo> = [
             (
@@ -485,22 +513,41 @@ mod tests {
         let kvm = Kvm::new().unwrap();
         let vm = kvm.create_vm().unwrap();
         let gic = create_gic(&vm, 1, None).unwrap();
-        assert!(create_fdt(
+        create_fdt(
             &mem,
             vec![0],
             CString::new("console=tty0").unwrap(),
             &dev_info,
-            gic.as_ref(),
+            &gic,
+            &None,
             &None,
         )
-        .is_ok())
+        .unwrap();
+    }
+
+    #[test]
+    fn test_create_fdt_with_vmgenid() {
+        let mem = arch_mem(layout::FDT_MAX_SIZE + 0x1000);
+        let mut resource_allocator = ResourceAllocator::new().unwrap();
+        let vmgenid = VmGenId::new(&mem, &mut resource_allocator).unwrap();
+        let kvm = Kvm::new().unwrap();
+        let vm = kvm.create_vm().unwrap();
+        let gic = create_gic(&vm, 1, None).unwrap();
+        create_fdt(
+            &mem,
+            vec![0],
+            CString::new("console=tty0").unwrap(),
+            &HashMap::<(DeviceType, std::string::String), MMIODeviceInfo>::new(),
+            &gic,
+            &Some(vmgenid),
+            &None,
+        )
+        .unwrap();
     }
 
     #[test]
     fn test_create_fdt() {
-        let regions = arch_memory_regions(layout::FDT_MAX_SIZE + 0x1000);
-        let mem = utils::vm_memory::test_utils::create_anon_guest_memory(&regions, false)
-            .expect("Cannot initialize memory");
+        let mem = arch_mem(layout::FDT_MAX_SIZE + 0x1000);
         let kvm = Kvm::new().unwrap();
         let vm = kvm.create_vm().unwrap();
         let gic = create_gic(&vm, 1, None).unwrap();
@@ -516,7 +563,8 @@ mod tests {
             vec![0],
             CString::new("console=tty0").unwrap(),
             &HashMap::<(DeviceType, std::string::String), MMIODeviceInfo>::new(),
-            gic.as_ref(),
+            &gic,
+            &None,
             &None,
         )
         .unwrap();
@@ -535,13 +583,13 @@ mod tests {
         // let mut output = fs::OpenOptions::new()
         // .write(true)
         // .create(true)
-        // .open(path.join(format!("src/aarch64/{}", dtb_path)))
+        // .open(path.join(format!("src/arch/aarch64/{}", dtb_path)))
         // .unwrap();
         // output.write_all(&current_dtb_bytes).unwrap();
         // }
 
         let pos = 4;
-        let val = layout::FDT_MAX_SIZE;
+        let val = u32::try_from(layout::FDT_MAX_SIZE).unwrap();
         let mut buf = vec![];
         buf.extend_from_slice(saved_dtb_bytes);
 
@@ -556,9 +604,7 @@ mod tests {
 
     #[test]
     fn test_create_fdt_with_initrd() {
-        let regions = arch_memory_regions(layout::FDT_MAX_SIZE + 0x1000);
-        let mem = utils::vm_memory::test_utils::create_anon_guest_memory(&regions, false)
-            .expect("Cannot initialize memory");
+        let mem = arch_mem(layout::FDT_MAX_SIZE + 0x1000);
         let kvm = Kvm::new().unwrap();
         let vm = kvm.create_vm().unwrap();
         let gic = create_gic(&vm, 1, None).unwrap();
@@ -579,7 +625,8 @@ mod tests {
             vec![0],
             CString::new("console=tty0").unwrap(),
             &HashMap::<(DeviceType, std::string::String), MMIODeviceInfo>::new(),
-            gic.as_ref(),
+            &gic,
+            &None,
             &Some(initrd),
         )
         .unwrap();
@@ -598,13 +645,13 @@ mod tests {
         // let mut output = fs::OpenOptions::new()
         // .write(true)
         // .create(true)
-        // .open(path.join(format!("src/aarch64/{}", dtb_path)))
+        // .open(path.join(format!("src/arch/aarch64/{}", dtb_path)))
         // .unwrap();
         // output.write_all(&current_dtb_bytes).unwrap();
         // }
 
         let pos = 4;
-        let val = layout::FDT_MAX_SIZE;
+        let val = u32::try_from(layout::FDT_MAX_SIZE).unwrap();
         let mut buf = vec![];
         buf.extend_from_slice(saved_dtb_bytes);
 

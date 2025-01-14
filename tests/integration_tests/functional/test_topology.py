@@ -2,14 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for ensuring correctness of CPU and cache topology in the guest."""
 
-import json
-import os
 import platform
-from ast import literal_eval
+import subprocess
 
 import pytest
 
 import framework.utils_cpuid as utils
+from framework.properties import global_props
 
 TOPOLOGY_STR = {1: "0", 2: "0,1", 16: "0-15"}
 PLATFORM = platform.machine()
@@ -44,23 +43,26 @@ def _check_cache_topology_x86(
     )
 
     cpu_vendor = utils.get_cpu_vendor()
+    expected_level_1_topology = expected_level_3_topology = None
     if cpu_vendor == utils.CpuVendor.AMD:
+        key_share = "extra cores sharing this cache"
         expected_level_1_topology = {
             "level": "0x1 (1)",
-            "extra cores sharing this cache": expected_lvl_1_str,
+            key_share: expected_lvl_1_str,
         }
         expected_level_3_topology = {
             "level": "0x3 (3)",
-            "extra cores sharing this cache": expected_lvl_3_str,
+            key_share: expected_lvl_3_str,
         }
     elif cpu_vendor == utils.CpuVendor.INTEL:
+        key_share = "maximum IDs for CPUs sharing cache"
         expected_level_1_topology = {
             "cache level": "0x1 (1)",
-            "extra threads sharing this cache": expected_lvl_1_str,
+            key_share: expected_lvl_1_str,
         }
         expected_level_3_topology = {
             "cache level": "0x3 (3)",
-            "extra threads sharing this cache": expected_lvl_3_str,
+            key_share: expected_lvl_3_str,
         }
 
     utils.check_guest_cpuid_output(
@@ -77,7 +79,22 @@ def _check_cache_topology_x86(
     )
 
 
-def _check_cache_topology_arm(test_microvm, no_cpus):
+def _aarch64_parse_cache_info(test_microvm, no_cpus):
+    def parse_cache_info(info: str):
+        "One line looks like this: /sys/devices/system/cpu/cpuX/cache/{index}/{name}:{value}"
+        cache_info = []
+        for line in info.splitlines():
+            parts = line.split("/")
+
+            index = int(parts[-2][-1])
+
+            name, value = parts[-1].split(":")
+
+            if len(cache_info) == index:
+                cache_info.append({})
+            cache_info[index][name] = value
+        return cache_info
+
     # We will check the cache topology by looking at what each cpu
     # contains as far as cache info.
     # For that we are iterating through the hierarchy of folders inside:
@@ -85,57 +102,65 @@ def _check_cache_topology_arm(test_microvm, no_cpus):
     # (i.e Instruction, Data, Unified)
     # /sys/devices/system/cpu/cpuX/cache/indexY/size - size of the cache
     # /sys/devices/system/cpu/cpuX/cache/indexY/level - L1, L2 or L3 cache.
-    # There are 2 types of L1 cache (instruction and data) that is why the
-    # "cache_info" variable below has 4 items.
+    fields = ["level", "type", "size", "coherency_line_size", "number_of_sets"]
+    cmd = f"grep . /sys/devices/system/cpu/cpu{{0..{no_cpus-1}}}/cache/index*/{{{','.join(fields)}}} |sort"
 
-    path = "/sys/devices/system/cpu/"
+    _, guest_stdout, guest_stderr = test_microvm.ssh.run(cmd)
+    assert guest_stderr == ""
 
-    cache_files = ["level", "type", "size", "coherency_line_size", "number_of_sets"]
-
-    _, stdout, stderr = test_microvm.ssh.execute_command(
-        "/usr/local/bin/get_cache_info.sh"
+    host_result = subprocess.run(
+        cmd,
+        shell=True,
+        executable="/bin/bash",
+        capture_output=True,
+        check=True,
+        encoding="ascii",
     )
-    assert stderr.read() == ""
+    assert host_result.stderr == ""
+    host_stdout = host_result.stdout
 
-    guest_dict = json.loads(literal_eval(stdout.read().strip()))
-    host_dict = {}
-    for i in range(no_cpus):
-        cpu_path = os.path.join(os.path.join(path, "cpu{}".format(i)), "cache")
-        dirs = os.listdir(cpu_path)
-        for cache_level in dirs:
-            if "index" not in os.path.basename(cache_level):
-                continue
-            cache_path = os.path.join(cpu_path, cache_level)
+    guest_cache_info = parse_cache_info(guest_stdout)
+    host_cache_info = parse_cache_info(host_stdout)
 
-            for cache_file in cache_files:
-                absolute_cache_file = os.path.join(cache_path, cache_file)
-                with open(absolute_cache_file, "r", encoding="utf-8") as file:
-                    host_val = file.readline().strip()
-                    host_dict[str(absolute_cache_file)] = str(host_val)
-    assert guest_dict == host_dict
+    return guest_cache_info, host_cache_info
+
+
+def _check_cache_topology_arm(test_microvm, no_cpus, kernel_version_tpl):
+    guest_cache_info, host_cache_info = _aarch64_parse_cache_info(test_microvm, no_cpus)
+
+    # Starting from 6.3 kernel cache representation for aarch64 platform has changed.
+    # It is no longer equivalent to the host cache representation.
+    # The main change is in the level 1 cache, so for newer kernels we
+    # compare only level 2 and level 3 caches
+    if kernel_version_tpl < (6, 3):
+        assert guest_cache_info == host_cache_info
+    else:
+        guest_first_non_level_1 = 0
+        while guest_cache_info[guest_first_non_level_1]["level"] == "1":
+            guest_first_non_level_1 += 1
+        guest_slice = guest_cache_info[guest_first_non_level_1:]
+
+        host_first_non_level_1 = 0
+        while host_cache_info[host_first_non_level_1]["level"] == "1":
+            host_first_non_level_1 += 1
+        host_slice = host_cache_info[host_first_non_level_1:]
+
+        assert guest_slice == host_slice
 
 
 @pytest.mark.skipif(
     PLATFORM != "x86_64", reason="Firecracker supports CPU topology only on x86_64."
 )
-@pytest.mark.parametrize(
-    "num_vcpus",
-    [1, 2, 16],
-)
-@pytest.mark.parametrize(
-    "htt",
-    [True, False],
-)
-def test_cpu_topology(test_microvm_with_api, network_config, num_vcpus, htt):
+@pytest.mark.parametrize("num_vcpus", [1, 2, 16])
+@pytest.mark.parametrize("htt", [True, False])
+def test_cpu_topology(uvm_plain_any, num_vcpus, htt):
     """
     Check the CPU topology for a microvm with the specified config.
-
-    @type: functional
     """
-    vm = test_microvm_with_api
+    vm = uvm_plain_any
     vm.spawn()
     vm.basic_config(vcpu_count=num_vcpus, smt=htt)
-    _tap, _, _ = vm.ssh_network_config(network_config, "1")
+    vm.add_net_iface()
     vm.start()
 
     _check_cpu_topology(
@@ -143,30 +168,22 @@ def test_cpu_topology(test_microvm_with_api, network_config, num_vcpus, htt):
     )
 
 
-@pytest.mark.parametrize(
-    "num_vcpus",
-    [1, 2, 16],
-)
-@pytest.mark.parametrize(
-    "htt",
-    [True, False],
-)
-def test_cache_topology(test_microvm_with_api, network_config, num_vcpus, htt):
+@pytest.mark.parametrize("num_vcpus", [1, 2, 16])
+@pytest.mark.parametrize("htt", [True, False])
+def test_cache_topology(uvm_plain_any, num_vcpus, htt):
     """
     Check the cache topology for a microvm with the specified config.
-
-    @type: functional
     """
     if htt and PLATFORM == "aarch64":
         pytest.skip("SMT is configurable only on x86.")
-    vm = test_microvm_with_api
+    vm = uvm_plain_any
     vm.spawn()
     vm.basic_config(vcpu_count=num_vcpus, smt=htt)
-    _tap, _, _ = vm.ssh_network_config(network_config, "1")
+    vm.add_net_iface()
     vm.start()
     if PLATFORM == "x86_64":
         _check_cache_topology_x86(vm, 1 if htt and num_vcpus > 1 else 0, num_vcpus - 1)
     elif PLATFORM == "aarch64":
-        _check_cache_topology_arm(vm, num_vcpus)
+        _check_cache_topology_arm(vm, num_vcpus, global_props.host_linux_version_tpl)
     else:
         raise Exception("This test is not run on this platform!")

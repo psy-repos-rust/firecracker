@@ -4,35 +4,31 @@
 use std::collections::BTreeMap;
 use std::{env, fmt, result};
 
-pub type Result<T> = result::Result<T, Error>;
+pub type Result<T> = result::Result<T, UtilsArgParserError>;
 
 const ARG_PREFIX: &str = "--";
 const ARG_SEPARATOR: &str = "--";
 const HELP_ARG: &str = "--help";
+const SHORT_HELP_ARG: &str = "-h";
 const VERSION_ARG: &str = "--version";
 
 /// Errors associated with parsing and validating arguments.
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub enum Error {
-    /// The argument B cannot be used together with argument A.
-    #[error("Argument '{1}' cannot be used together with argument '{0}'.")]
+#[derive(Debug, PartialEq, Eq, thiserror::Error, displaydoc::Display)]
+pub enum UtilsArgParserError {
+    /// Argument '{1}' cannot be used together with argument '{0}'.
     ForbiddenArgument(String, String),
-    /// The required argument was not provided.
-    #[error("Argument '{0}' required, but not found.")]
+    /// Argument '{0}' required, but not found.
     MissingArgument(String),
-    /// A value for the argument was not provided.
-    #[error("The argument '{0}' requires a value, but none was supplied.")]
+    /// The argument '{0}' requires a value, but none was supplied.
     MissingValue(String),
-    /// The provided argument was not expected.
-    #[error("Found argument '{0}' which wasn't expected, or isn't valid in this context.")]
+    /// Found argument '{0}' which wasn't expected, or isn't valid in this context.
     UnexpectedArgument(String),
-    /// The argument was provided more than once.
-    #[error("The argument '{0}' was provided more than once.")]
+    /// The argument '{0}' was provided more than once.
     DuplicateArgument(String),
 }
 
 /// Keep information about the argument parser.
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ArgParser<'a> {
     arguments: Arguments<'a>,
 }
@@ -260,7 +256,7 @@ impl fmt::Display for Value {
 }
 
 /// Stores the arguments of the parser.
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Arguments<'a> {
     // A BTreeMap in which the key is an argument and the value is its associated `Argument`.
     args: BTreeMap<&'a str, Argument<'a>>,
@@ -335,10 +331,10 @@ impl<'a> Arguments<'a> {
         let (args, extra_args) = Arguments::split_args(&args[1..]);
         self.extra_args = extra_args.to_vec();
 
-        // If `--help` is provided as a parameter, we artificially skip the parsing of other
+        // If `--help` or `-h`is provided as a parameter, we artificially skip the parsing of other
         // command line arguments by adding just the help argument to the parsed list and
         // returning.
-        if args.contains(&HELP_ARG.to_string()) {
+        if args.contains(&HELP_ARG.to_string()) || args.contains(&SHORT_HELP_ARG.to_string()) {
             let mut help_arg = Argument::new("help").help("Show the help message.");
             help_arg.user_value = Some(Value::Flag);
             self.insert_arg(help_arg);
@@ -365,20 +361,22 @@ impl<'a> Arguments<'a> {
         for argument in self.args.values() {
             // The arguments that are marked `required` must be provided by user.
             if argument.required && argument.user_value.is_none() {
-                return Err(Error::MissingArgument(argument.name.to_string()));
+                return Err(UtilsArgParserError::MissingArgument(
+                    argument.name.to_string(),
+                ));
             }
             if argument.user_value.is_some() {
                 // For the arguments that require a specific argument to be also present in the list
                 // of arguments provided by user, search for that argument.
                 if let Some(arg_name) = argument.requires {
                     if !args.contains(&(format!("--{}", arg_name))) {
-                        return Err(Error::MissingArgument(arg_name.to_string()));
+                        return Err(UtilsArgParserError::MissingArgument(arg_name.to_string()));
                     }
                 }
                 // Check the user-provided list for potential forbidden arguments.
                 for arg_name in argument.forbids.iter() {
                     if args.contains(&(format!("--{}", arg_name))) {
-                        return Err(Error::ForbiddenArgument(
+                        return Err(UtilsArgParserError::ForbiddenArgument(
                             argument.name.to_string(),
                             arg_name.to_string(),
                         ));
@@ -392,7 +390,7 @@ impl<'a> Arguments<'a> {
     // Does a general validation of `arg` command line argument.
     fn validate_arg(&self, arg: &str) -> Result<()> {
         if !arg.starts_with(ARG_PREFIX) {
-            return Err(Error::UnexpectedArgument(arg.to_string()));
+            return Err(UtilsArgParserError::UnexpectedArgument(arg.to_string()));
         }
         let arg_name = &arg[ARG_PREFIX.len()..];
 
@@ -401,10 +399,10 @@ impl<'a> Arguments<'a> {
         let argument = self
             .args
             .get(arg_name)
-            .ok_or_else(|| Error::UnexpectedArgument(arg_name.to_string()))?;
+            .ok_or_else(|| UtilsArgParserError::UnexpectedArgument(arg_name.to_string()))?;
 
         if !argument.allow_multiple && argument.user_value.is_some() {
-            return Err(Error::DuplicateArgument(arg_name.to_string()));
+            return Err(UtilsArgParserError::DuplicateArgument(arg_name.to_string()));
         }
         Ok(())
     }
@@ -419,16 +417,15 @@ impl<'a> Arguments<'a> {
 
             // If the `arg` argument is indeed an expected one, set the value provided by user
             // if it's a valid one.
-            let argument = self
-                .args
-                .get_mut(&arg[ARG_PREFIX.len()..])
-                .ok_or_else(|| Error::UnexpectedArgument(arg[ARG_PREFIX.len()..].to_string()))?;
+            let argument = self.args.get_mut(&arg[ARG_PREFIX.len()..]).ok_or_else(|| {
+                UtilsArgParserError::UnexpectedArgument(arg[ARG_PREFIX.len()..].to_string())
+            })?;
 
             let arg_val = if argument.takes_value {
                 let val = iter
                     .next()
                     .filter(|v| !v.starts_with(ARG_PREFIX))
-                    .ok_or_else(|| Error::MissingValue(argument.name.to_string()))?
+                    .ok_or_else(|| UtilsArgParserError::MissingValue(argument.name.to_string()))?
                     .clone();
 
                 if argument.allow_multiple {
@@ -438,7 +435,11 @@ impl<'a> Arguments<'a> {
                             Value::Multiple(v)
                         }
                         None => Value::Multiple(vec![val]),
-                        _ => return Err(Error::UnexpectedArgument(argument.name.to_string())),
+                        _ => {
+                            return Err(UtilsArgParserError::UnexpectedArgument(
+                                argument.name.to_string(),
+                            ))
+                        }
                     }
                 } else {
                     Value::Single(val)
@@ -647,7 +648,17 @@ mod tests {
             .map(String::from)
             .collect::<Vec<String>>();
 
-        assert!(arguments.parse(&args).is_ok());
+        arguments.parse(&args).unwrap();
+        assert!(arguments.args.contains_key("help"));
+
+        arguments = arg_parser.arguments().clone();
+
+        let args = vec!["binary-name", "--exec-file", "foo", "-h"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<String>>();
+
+        arguments.parse(&args).unwrap();
         assert!(arguments.args.contains_key("help"));
 
         arguments = arg_parser.arguments().clone();
@@ -657,7 +668,7 @@ mod tests {
             .map(String::from)
             .collect::<Vec<String>>();
 
-        assert!(arguments.parse(&args).is_ok());
+        arguments.parse(&args).unwrap();
         assert!(arguments.args.contains_key("version"));
 
         arguments = arg_parser.arguments().clone();
@@ -669,7 +680,9 @@ mod tests {
 
         assert_eq!(
             arguments.parse(&args),
-            Err(Error::MissingValue("describe-snapshot".to_string()))
+            Err(UtilsArgParserError::MissingValue(
+                "describe-snapshot".to_string()
+            ))
         );
 
         arguments = arg_parser.arguments().clone();
@@ -687,7 +700,9 @@ mod tests {
 
         assert_eq!(
             arguments.parse(&args),
-            Err(Error::MissingValue("describe-snapshot".to_string()))
+            Err(UtilsArgParserError::MissingValue(
+                "describe-snapshot".to_string()
+            ))
         );
 
         arguments = arg_parser.arguments().clone();
@@ -706,7 +721,7 @@ mod tests {
 
         assert_eq!(
             arguments.parse(&args),
-            Err(Error::MissingValue("api-sock".to_string()))
+            Err(UtilsArgParserError::MissingValue("api-sock".to_string()))
         );
 
         arguments = arg_parser.arguments().clone();
@@ -726,7 +741,9 @@ mod tests {
 
         assert_eq!(
             arguments.parse(&args),
-            Err(Error::DuplicateArgument("api-sock".to_string()))
+            Err(UtilsArgParserError::DuplicateArgument(
+                "api-sock".to_string()
+            ))
         );
 
         arguments = arg_parser.arguments().clone();
@@ -738,7 +755,9 @@ mod tests {
 
         assert_eq!(
             arguments.parse(&args),
-            Err(Error::MissingArgument("exec-file".to_string()))
+            Err(UtilsArgParserError::MissingArgument(
+                "exec-file".to_string()
+            ))
         );
 
         arguments = arg_parser.arguments().clone();
@@ -757,7 +776,9 @@ mod tests {
 
         assert_eq!(
             arguments.parse(&args),
-            Err(Error::UnexpectedArgument("invalid-arg".to_string()))
+            Err(UtilsArgParserError::UnexpectedArgument(
+                "invalid-arg".to_string()
+            ))
         );
 
         arguments = arg_parser.arguments().clone();
@@ -778,7 +799,9 @@ mod tests {
 
         assert_eq!(
             arguments.parse(&args),
-            Err(Error::MissingArgument("config-file".to_string()))
+            Err(UtilsArgParserError::MissingArgument(
+                "config-file".to_string()
+            ))
         );
 
         arguments = arg_parser.arguments().clone();
@@ -797,7 +820,7 @@ mod tests {
 
         assert_eq!(
             arguments.parse(&args),
-            Err(Error::MissingValue("id".to_string()))
+            Err(UtilsArgParserError::MissingValue("id".to_string()))
         );
 
         arguments = arg_parser.arguments().clone();
@@ -817,7 +840,9 @@ mod tests {
 
         assert_eq!(
             arguments.parse(&args),
-            Err(Error::UnexpectedArgument("foobar".to_string()))
+            Err(UtilsArgParserError::UnexpectedArgument(
+                "foobar".to_string()
+            ))
         );
 
         arguments = arg_parser.arguments().clone();
@@ -840,7 +865,7 @@ mod tests {
 
         assert_eq!(
             arguments.parse(&args),
-            Err(Error::ForbiddenArgument(
+            Err(UtilsArgParserError::ForbiddenArgument(
                 "no-seccomp".to_string(),
                 "seccomp-filter".to_string(),
             ))
@@ -866,7 +891,7 @@ mod tests {
 
         assert_eq!(
             arguments.parse(&args),
-            Err(Error::ForbiddenArgument(
+            Err(UtilsArgParserError::ForbiddenArgument(
                 "no-seccomp".to_string(),
                 "seccomp-filter".to_string(),
             ))
@@ -888,7 +913,9 @@ mod tests {
 
         assert_eq!(
             arguments.parse(&args),
-            Err(Error::UnexpectedArgument("foobar".to_string()))
+            Err(UtilsArgParserError::UnexpectedArgument(
+                "foobar".to_string()
+            ))
         );
 
         arguments = arg_parser.arguments().clone();
@@ -900,7 +927,7 @@ mod tests {
 
         assert_eq!(
             arguments.parse(&args),
-            Err(Error::UnexpectedArgument("foo".to_string()))
+            Err(UtilsArgParserError::UnexpectedArgument("foo".to_string()))
         );
 
         arguments = arg_parser.arguments().clone();
@@ -922,7 +949,7 @@ mod tests {
         .map(String::from)
         .collect::<Vec<String>>();
 
-        assert!(arguments.parse(&args).is_ok());
+        arguments.parse(&args).unwrap();
         assert!(arguments.extra_args.contains(&"--extra-flag".to_string()));
     }
 
@@ -958,24 +985,33 @@ mod tests {
         assert_eq!(
             format!(
                 "{}",
-                Error::ForbiddenArgument("foo".to_string(), "bar".to_string())
+                UtilsArgParserError::ForbiddenArgument("foo".to_string(), "bar".to_string())
             ),
             "Argument 'bar' cannot be used together with argument 'foo'."
         );
         assert_eq!(
-            format!("{}", Error::MissingArgument("foo".to_string())),
+            format!(
+                "{}",
+                UtilsArgParserError::MissingArgument("foo".to_string())
+            ),
             "Argument 'foo' required, but not found."
         );
         assert_eq!(
-            format!("{}", Error::MissingValue("foo".to_string())),
+            format!("{}", UtilsArgParserError::MissingValue("foo".to_string())),
             "The argument 'foo' requires a value, but none was supplied."
         );
         assert_eq!(
-            format!("{}", Error::UnexpectedArgument("foo".to_string())),
+            format!(
+                "{}",
+                UtilsArgParserError::UnexpectedArgument("foo".to_string())
+            ),
             "Found argument 'foo' which wasn't expected, or isn't valid in this context."
         );
         assert_eq!(
-            format!("{}", Error::DuplicateArgument("foo".to_string())),
+            format!(
+                "{}",
+                UtilsArgParserError::DuplicateArgument("foo".to_string())
+            ),
             "The argument 'foo' was provided more than once."
         );
     }
@@ -1010,7 +1046,9 @@ mod tests {
 
         assert_eq!(
             arguments.parse(&args),
-            Err(Error::DuplicateArgument("no-multiple".to_string()))
+            Err(UtilsArgParserError::DuplicateArgument(
+                "no-multiple".to_string()
+            ))
         );
 
         arguments = arg_parser.arguments().clone();
@@ -1022,7 +1060,7 @@ mod tests {
             .map(String::from)
             .collect::<Vec<String>>();
 
-        assert!(arguments.parse(&args).is_ok());
+        arguments.parse(&args).unwrap();
 
         arguments = arg_parser.arguments().clone();
 
@@ -1032,7 +1070,7 @@ mod tests {
             .map(String::from)
             .collect::<Vec<String>>();
 
-        assert!(arguments.parse(&args).is_ok());
+        arguments.parse(&args).unwrap();
 
         // Check dulicates require a value
         let args = vec!["binary-name", "--multiple", "--multiple", "2"]
@@ -1042,7 +1080,7 @@ mod tests {
 
         assert_eq!(
             arguments.parse(&args),
-            Err(Error::MissingValue("multiple".to_string()))
+            Err(UtilsArgParserError::MissingValue("multiple".to_string()))
         );
     }
 }

@@ -6,16 +6,14 @@
 from framework.microvm import Serial
 
 
-def test_init_params(test_microvm_with_api):
+def test_init_params(uvm_plain):
     """Correct propagation of boot args to the kernel's command line.
 
     Test that init's parameters (the ones present after "--") do not get
     altered or misplaced.
-
-    @type: negative
     """
-    vm = test_microvm_with_api
-    vm.jailer.daemonize = False
+    vm = uvm_plain
+    vm.help.enable_console()
     vm.spawn()
     vm.memory_monitor = None
 
@@ -31,4 +29,4 @@ def test_init_params(test_microvm_with_api):
     serial = Serial(vm)
     serial.open()
     # If the string does not show up, the test will fail.
-    serial.rx(token="Ubuntu 18.04.5 LTS")
+    serial.rx(token="Ubuntu 24.04")

@@ -32,10 +32,10 @@ you want to merge your changes to Firecracker:
    against the main branch of the Firecracker repository.
 1. Add two reviewers to your pull request (a maintainer will do that for you if
    you're new). Work with your reviewers to address any comments and obtain a
-   minimum of 2 approvals, at least one of which must be provided by
-   [a maintainer](MAINTAINERS.md).
-   To update your pull request amend existing commits whenever applicable and
-   then push the new changes to your pull request branch.
+   minimum of 2 approvals from [maintainers](MAINTAINERS.md). To update your
+   pull request, amend existing commits whenever applicable. Then force-push the
+   new changes to your pull request branch. Address all review comments you
+   receive.
 1. Once the pull request is approved, one of the maintainers will merge it.
 
 ## Request for Comments
@@ -65,17 +65,49 @@ cargo install rusty-hook
 rusty-hook init
 ```
 
+This project also has linters for Python and Markdown. These will be called by
+the pre-commit when you modify any Python and Markdown files. In order to make
+sure you are setup we recommend you install
+[poetry](https://python-poetry.org/docs/) and
+[pyenv](https://github.com/pyenv/pyenv?tab=readme-ov-file#installation).
+
+Poetry is used by this project and pyenv will help you make sure you have a
+Python version compatible with the poetry python project we use as part of
+`./tools/devctr`.
+
+Once you have these two installed you can run the following to install the dev
+container poetry project:
+
+```
+poetry -C ./tools/devctr install --no-root
+```
+
+Then, you can activate the poetry virtual environment by running:
+
+```
+poetry shell -C ./tools/devctr
+```
+
+Which you will need to do after modifying python or markdown files so that the
+pre-commit can finish successfully.
+
 Your contribution needs to meet the following standards:
 
 - Separate each **logical change** into its own commit.
+
 - Each commit must pass all unit & code style tests, and the full pull request
   must pass all integration tests. See [tests/README.md](tests/README.md) for
   information on how to run tests.
+
 - Unit test coverage must _increase_ the overall project code coverage.
+
 - Include integration tests for any new functionality in your pull request.
+
 - Document all your public functions.
+
 - Add a descriptive message for each commit. Follow
   [commit message best practices](https://github.com/erlang/otp/wiki/writing-good-commit-messages).
+
 - A good commit message may look like
 
   ```
@@ -87,18 +119,18 @@ Your contribution needs to meet the following standards:
   Co-authored-by: <B full name> <B email>
   ```
 
-- **Usage of `unsafe` is heavily discouraged**. If `unsafe` is required,
-  it should be accompanied by a comment detailing its...
+- **Usage of `unsafe` is heavily discouraged**. If `unsafe` is required, it
+  should be accompanied by a comment detailing its...
+
   - Justification, potentially including quantifiable reasons why safe
     alternatives were not used (e.g. via a benchmark showing a valuable[^1]
     performance improvements).
-  - Safety, as per [`clippy::undocumented_unsafe_blocks`](https://rust-lang.github.io/rust-clippy/master/#undocumented_unsafe_blocks).
-    This comment must list all invariants of the called function, and
-    explain why there are upheld. If relevant, it must also prove that
+  - Safety, as per
+    [`clippy::undocumented_unsafe_blocks`](https://rust-lang.github.io/rust-clippy/master/#undocumented_unsafe_blocks).
+    This comment must list all invariants of the called function, and explain
+    why there are upheld. If relevant, it must also prove that
     [undefined behavior](https://doc.rust-lang.org/reference/behavior-considered-undefined.html)
     is not possible.
-
-  [^1]: Performance improvements in non-hot paths are unlikely to be considered valuable.
 
   E.g.
 
@@ -113,8 +145,36 @@ Your contribution needs to meet the following standards:
   }
   ```
 
-- Document your pull requests. Include the reasoning behind each change, and
-  the testing done.
+- Avoid using `Option::unwrap`/`Result::unwrap`. Prefer propagating errors
+  instead of aborting execution, or using `Option::expect`/`Result::except` if
+  no alternative exists. Leave a comment explaining why the code will not panic
+  in practice. Often, `unwrap`s are used because a previous check ensures they
+  are safe, e.g.
+
+  ```rs
+  let my_value: u32 = ...;
+  if my_value <= u16::MAX {
+      Ok(my_value.try_into::<u16>().unwrap())
+  } else {
+      Err(Error::Overflow)
+  }
+  ```
+
+  These can often be rewritten using `.map`/`.map_err` or `match`/`if let`
+  constructs such as
+
+  ```rs
+  my_value.try_into::<u16>()
+      .map_err(|_| Error::Overflow)
+  ```
+
+  See also
+  [this PR](https://github.com/firecracker-microvm/firecracker/pull/3557) for a
+  lot of examples.
+
+- Document your pull requests. Include the reasoning behind each change, and the
+  testing done.
+
 - Acknowledge Firecracker's [Apache 2.0 license](LICENSE) and certify that no
   part of your contribution contravenes this license by signing off on all your
   commits with `git -s`. Ensure that every file in your pull request has a
@@ -122,15 +182,16 @@ Your contribution needs to meet the following standards:
 
 ## Developer Certificate of Origin
 
-Firecracker is an open source product released under the [Apache 2.0 license](LICENSE).
+Firecracker is an open source product released under the
+[Apache 2.0 license](LICENSE).
 
 We respect intellectual property rights of others and we want to make sure all
-incoming contributions are correctly attributed and licensed.
-A Developer Certificate of Origin (DCO) is a lightweight mechanism to do that.
+incoming contributions are correctly attributed and licensed. A Developer
+Certificate of Origin (DCO) is a lightweight mechanism to do that.
 
-The DCO is a declaration attached to every contribution made by every
-developer. In the commit message of the contribution, the developer simply adds
-a `Signed-off-by` statement and thereby agrees to the DCO, which you can find
+The DCO is a declaration attached to every contribution made by every developer.
+In the commit message of the contribution, the developer simply adds a
+`Signed-off-by` statement and thereby agrees to the DCO, which you can find
 below or at DeveloperCertificate.org (<http://developercertificate.org/>).
 
 ```
@@ -167,16 +228,19 @@ Certificate of Origin. DCO checks are enabled via <https://github.com/apps/dco>,
 and your PR will fail CI without it.
 
 Additionally, we kindly ask you to use your real name. We do not accept
-anonymous contributors, nor those utilizing pseudonyms.
-Each commit must include a DCO which looks like this:
+anonymous contributors, nor those utilizing pseudonyms. Each commit must include
+a DCO which looks like this:
 
 ```
 Signed-off-by: Jane Smith <jane.smith@email.com>
 ```
 
-You may type this line on your own when writing your commit messages.
-However, if your `user.name` and `user.email` are set in your git config,
-you can use `-s` or `--signoff` to add the `Signed-off-by` line to the end of
-the commit message automatically.
+You may type this line on your own when writing your commit messages. However,
+if your `user.name` and `user.email` are set in your git config, you can use
+`-s` or `--signoff` to add the `Signed-off-by` line to the end of the commit
+message automatically.
 
 Forgot to add DCO to a commit? Amend it with `git commit --amend -s`.
+
+[^1]: Performance improvements in non-hot paths are unlikely to be considered
+    valuable.

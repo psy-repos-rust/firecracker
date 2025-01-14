@@ -1,72 +1,53 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::fmt::{Display, Formatter, Result};
 use std::fs::File;
 use std::io;
 
 use serde::{Deserialize, Serialize};
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
 
 /// Default guest kernel command line:
 /// - `reboot=k` shut down the guest on reboot, instead of well... rebooting;
 /// - `panic=1` on panic, reboot after 1 second;
 /// - `pci=off` do not scan for PCI devices (save boot time);
-/// - `nomodules` disable loadable kernel module support;
+/// - `nomodule` disable loadable kernel module support;
 /// - `8250.nr_uarts=0` disable 8250 serial interface;
 /// - `i8042.noaux` do not probe the i8042 controller for an attached mouse (save boot time);
 /// - `i8042.nomux` do not probe i8042 for a multiplexing controller (save boot time);
 /// - `i8042.nopnp` do not use ACPIPnP to discover KBD/AUX controllers (save boot time);
 /// - `i8042.dumbkbd` do not attempt to control kbd state via the i8042 (save boot time).
-pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=1 pci=off nomodules 8250.nr_uarts=0 \
+pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=1 pci=off nomodule 8250.nr_uarts=0 \
                                           i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd";
 
 /// Strongly typed data structure used to configure the boot source of the
 /// microvm.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize, Versionize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BootSourceConfig {
     /// Path of the kernel image.
     pub kernel_image_path: String,
     /// Path of the initrd, if there is one.
     pub initrd_path: Option<String>,
-    /// The boot arguments to pass to the kernel. If this field is uninitialized, the default
-    /// kernel command line is used: `reboot=k panic=1 pci=off nomodules 8250.nr_uarts=0`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The boot arguments to pass to the kernel. If this field is uninitialized,
+    /// DEFAULT_KERNEL_CMDLINE is used.
     pub boot_args: Option<String>,
 }
 
 /// Errors associated with actions on `BootSourceConfig`.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum BootSourceConfigError {
-    /// The kernel file cannot be opened.
+    /// The kernel file cannot be opened: {0}
     InvalidKernelPath(io::Error),
-    /// The initrd file cannot be opened.
+    /// The initrd file cannot be opened due to invalid path or invalid permissions. {0}
     InvalidInitrdPath(io::Error),
-    /// The kernel command line is invalid.
+    /// The kernel command line is invalid: {0}
     InvalidKernelCommandLine(String),
-}
-
-impl Display for BootSourceConfigError {
-    fn fmt(&self, f: &mut Formatter) -> Result {
-        use self::BootSourceConfigError::*;
-        match *self {
-            InvalidKernelPath(ref err) => write!(f, "The kernel file cannot be opened: {}", err),
-            InvalidInitrdPath(ref err) => write!(
-                f,
-                "The initrd file cannot be opened due to invalid path or invalid permissions. {}",
-                err,
-            ),
-            InvalidKernelCommandLine(ref err) => {
-                write!(f, "The kernel command line is invalid: {}", err.as_str())
-            }
-        }
-    }
+    /// Firecracker's huge pages support is incompatible with initrds.
+    HugePagesAndInitRd,
 }
 
 /// Holds the kernel specification (both configuration as well as runtime details).
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct BootSource {
     /// The boot source configuration.
     pub config: BootSourceConfig,
@@ -76,6 +57,7 @@ pub struct BootSource {
 }
 
 /// Holds the kernel builder (created and validates based on BootSourceConfig).
+#[derive(Debug)]
 pub struct BootConfig {
     /// The commandline validated against correctness.
     pub cmdline: linux_loader::cmdline::Cmdline,
@@ -87,7 +69,7 @@ pub struct BootConfig {
 
 impl BootConfig {
     /// Creates the BootConfig based on a given configuration.
-    pub fn new(cfg: &BootSourceConfig) -> std::result::Result<Self, BootSourceConfigError> {
+    pub fn new(cfg: &BootSourceConfig) -> Result<Self, BootSourceConfigError> {
         use self::BootSourceConfigError::{
             InvalidInitrdPath, InvalidKernelCommandLine, InvalidKernelPath,
         };
@@ -117,9 +99,10 @@ impl BootConfig {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use utils::tempfile::TempFile;
+    use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
+    use crate::snapshot::Snapshot;
 
     #[test]
     fn test_boot_config() {
@@ -136,7 +119,21 @@ pub(crate) mod tests {
         assert!(boot_cfg.initrd_file.is_none());
         assert_eq!(
             boot_cfg.cmdline.as_cstring().unwrap().as_bytes_with_nul(),
-            [DEFAULT_KERNEL_CMDLINE.as_bytes(), &[b'\0']].concat()
+            [DEFAULT_KERNEL_CMDLINE.as_bytes(), b"\0"].concat()
         );
+    }
+
+    #[test]
+    fn test_serde() {
+        let boot_src_cfg = BootSourceConfig {
+            boot_args: Some(DEFAULT_KERNEL_CMDLINE.to_string()),
+            initrd_path: Some("/tmp/initrd".to_string()),
+            kernel_image_path: "./vmlinux.bin".to_string(),
+        };
+
+        let mut snapshot_data = vec![0u8; 1000];
+        Snapshot::serialize(&mut snapshot_data.as_mut_slice(), &boot_src_cfg).unwrap();
+        let restored_boot_cfg = Snapshot::deserialize(&mut snapshot_data.as_slice()).unwrap();
+        assert_eq!(boot_src_cfg, restored_boot_cfg);
     }
 }

@@ -6,19 +6,19 @@
 const MAX_INSTANCE_ID_LEN: usize = 64;
 const MIN_INSTANCE_ID_LEN: usize = 1;
 
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub enum Error {
-    #[error("Invalid char ({0}) at position {1}")]
+#[derive(Debug, PartialEq, Eq, thiserror::Error, displaydoc::Display)]
+pub enum ValidatorError {
+    /// Invalid char ({0}) at position {1}
     InvalidChar(char, usize), // (char, position)
-    #[error("Invalid len ({0});  the length must be between {1} and {2}")]
+    /// Invalid len ({0});  the length must be between {1} and {2}
     InvalidLen(usize, usize, usize), // (length, min, max)
 }
 
 /// Checks that the instance id only contains alphanumeric chars and hyphens
 /// and that the size is between 1 and 64 characters.
-pub fn validate_instance_id(input: &str) -> Result<(), Error> {
+pub fn validate_instance_id(input: &str) -> Result<(), ValidatorError> {
     if input.len() > MAX_INSTANCE_ID_LEN || input.len() < MIN_INSTANCE_ID_LEN {
-        return Err(Error::InvalidLen(
+        return Err(ValidatorError::InvalidLen(
             input.len(),
             MIN_INSTANCE_ID_LEN,
             MAX_INSTANCE_ID_LEN,
@@ -26,7 +26,7 @@ pub fn validate_instance_id(input: &str) -> Result<(), Error> {
     }
     for (i, c) in input.chars().enumerate() {
         if !(c == '-' || c.is_alphanumeric()) {
-            return Err(Error::InvalidChar(c, i));
+            return Err(ValidatorError::InvalidChar(c, i));
         }
     }
     Ok(())
@@ -42,18 +42,18 @@ mod tests {
             format!("{}", validate_instance_id("").unwrap_err()),
             "Invalid len (0);  the length must be between 1 and 64"
         );
-        assert!(validate_instance_id("12-3aa").is_ok());
+        validate_instance_id("12-3aa").unwrap();
         assert_eq!(
             format!("{}", validate_instance_id("12_3aa").unwrap_err()),
             "Invalid char (_) at position 2"
         );
         assert_eq!(
             validate_instance_id("12:3aa").unwrap_err(),
-            Error::InvalidChar(':', 2)
+            ValidatorError::InvalidChar(':', 2)
         );
         assert_eq!(
             validate_instance_id(str::repeat("a", MAX_INSTANCE_ID_LEN + 1).as_str()).unwrap_err(),
-            Error::InvalidLen(
+            ValidatorError::InvalidLen(
                 MAX_INSTANCE_ID_LEN + 1,
                 MIN_INSTANCE_ID_LEN,
                 MAX_INSTANCE_ID_LEN

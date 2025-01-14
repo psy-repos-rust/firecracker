@@ -2,33 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # pylint:disable=broad-except
-# pylint:disable=too-few-public-methods
 
 """
 Metadata we want to attach to tests for further analysis and troubleshooting
 """
-
+import os
 import platform
 import re
 import subprocess
 from pathlib import Path
 
-from framework.utils_cpuid import get_cpu_model_name, get_cpu_vendor
+from framework.utils import get_kernel_version
+from framework.utils_cpuid import get_cpu_codename, get_cpu_model_name, get_cpu_vendor
 from framework.utils_imdsv2 import imdsv2_get
 
 
 def run_cmd(cmd):
     """Return the stdout of a command"""
     return subprocess.check_output(cmd, shell=True).decode().strip()
-
-
-def get_kernel_version(level):
-    """Return the current kernel version in format `major.minor.patch`."""
-    linux_version = platform.release()
-    # 5.15.0-56-generic
-    # major, minor, patch
-    mmp = linux_version.split("-")[0].split(".")
-    return ".".join(mmp[:level])
 
 
 def get_os_version():
@@ -43,27 +34,60 @@ def get_os_version():
     return match.group(1)
 
 
+def get_host_os(kv: str = None):
+    """
+    Extract OS information from the kernel if it's there.
+
+    This only works for AL2 and AL2023
+
+    >>> get_host_os("6.1.41-63.118.amzn2023.x86_64")
+    amzn2023
+    """
+    if kv is None:
+        kv = platform.release()
+    parts = kv.split("-")
+    if len(parts) < 2:
+        return kv
+    misc = parts[1].split(".")
+    if len(misc) > 2 and misc[2] in {"amzn2", "amzn2023"}:
+        return misc[2]
+    return kv
+
+
 class GlobalProps:
     """Class to hold metadata about the testrun environment"""
 
     def __init__(self):
         self.cpu_architecture: str = platform.machine()
         self.cpu_model = get_cpu_model_name()
+        self.cpu_codename = get_cpu_codename()
         self.cpu_vendor = get_cpu_vendor().name.lower()
         self.cpu_microcode = run_cmd(
             "grep microcode /proc/cpuinfo |head -1 |awk '{print $3}'"
         )
         self.host_linux_full_version = platform.release()
         # major.minor
-        self.host_linux_version = get_kernel_version(2)
+        self.host_linux_version = get_kernel_version(1)
         # major.minor.patch
-        self.host_linux_patch = get_kernel_version(3)
+        self.host_linux_patch = get_kernel_version(2)
         self.os = get_os_version()
+        self.host_os = get_host_os() or "NA"
         self.libc_ver = "-".join(platform.libc_ver())
-        self.git_commit_id = run_cmd("git rev-parse HEAD")
-        self.git_branch = run_cmd("git show -s --pretty=%D HEAD")
-        self.git_origin_url = run_cmd("git config --get remote.origin.url")
         self.rust_version = run_cmd("rustc --version |awk '{print $2}'")
+        # Buildkite/PR information
+        self.buildkite_pipeline_slug = os.environ.get("BUILDKITE_PIPELINE_SLUG")
+        self.buildkite_build_number = os.environ.get("BUILDKITE_BUILD_NUMBER")
+        self.buildkite_pr = os.environ.get("BUILDKITE_PULL_REQUEST", "false") != "false"
+        self.buildkite_revision_a = os.environ.get("BUILDKITE_PULL_REQUEST_BASE_BRANCH")
+
+        if self._in_git_repo():
+            self.git_commit_id = run_cmd("git rev-parse HEAD")
+            self.git_branch = run_cmd("git show -s --pretty=%D HEAD")
+            self.git_origin_url = run_cmd("git config --get remote.origin.url")
+        else:
+            self.git_commit_id = None
+            self.git_branch = None
+            self.git_origin_url = None
 
         self.environment = self._detect_environment()
         if self.is_ec2:
@@ -72,6 +96,11 @@ class GlobalProps:
         else:
             self.instance = "NA"
             self.ami = "NA"
+
+    @property
+    def host_linux_version_tpl(self):
+        """Host Linux version major.minor, as a tuple for easy comparison"""
+        return tuple(int(x) for x in self.host_linux_version.split("."))
 
     @property
     def is_ec2(self):
@@ -91,6 +120,12 @@ class GlobalProps:
         except Exception:
             return "local"
 
+    def _in_git_repo(self):
+        try:
+            run_cmd("git rev-parse --show-toplevel")
+        except subprocess.CalledProcessError:
+            return False
+        return True
+
 
 global_props = GlobalProps()
-# TBD could do a props fixture for tests to use...

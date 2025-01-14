@@ -57,11 +57,7 @@
 #
 #
 # TODO:
-#   - Cache test binaries, preserving them across `./devtool test` invocations.
-#     At the moment, Firecracker is rebuilt everytime a test is run.
 #   - List tests by parsing the `pytest --collect-only` output.
-#   - Implement test filtering with `./devtool test --filter <filter>`
-#   - Find an easier way to run individual tests on existing binaries.
 #   - Add a `./devtool run` command to set up and run Firecracker.
 #   - Add a `./devtool diag` command to help with troubleshooting, by checking
 #     the most common failure conditions.
@@ -72,7 +68,7 @@
 DEVCTR_IMAGE_NO_TAG="public.ecr.aws/firecracker/fcuvm"
 
 # Development container tag
-DEVCTR_IMAGE_TAG=${DEVCTR_IMAGE_TAG:-v55}
+DEVCTR_IMAGE_TAG=${DEVCTR_IMAGE_TAG:-v77}
 
 # Development container image (name:tag)
 # This should be updated whenever we upgrade the development container.
@@ -109,29 +105,18 @@ CARGO_GIT_REGISTRY_DIR="${FC_BUILD_DIR}/cargo_git_registry"
 # Full path to the cargo target dir on the host.
 CARGO_TARGET_DIR="${FC_BUILD_DIR}/cargo_target"
 
-# Full path to the seccompiler cargo target dir on the host.
-CARGO_SECCOMPILER_TARGET_DIR="${FC_BUILD_DIR}/seccompiler"
-
-# Full path to the rebase-snap cargo target dir on the host.
-CARGO_REBASE_SNAP_TARGET_DIR="${FC_BUILD_DIR}/rebase-snap"
-
 # Full path to the Firecracker sources dir, as bind-mounted in the container.
 CTR_FC_ROOT_DIR="/firecracker"
 
 # Full path to the build dir, as bind-mounted in the container.
 CTR_FC_BUILD_DIR="${CTR_FC_ROOT_DIR}/build"
+CTR_TEST_RESULTS_DIR="${CTR_FC_ROOT_DIR}/test_results"
 
 # Full path to the cargo target dir, as bind-mounted in the container.
 CTR_CARGO_TARGET_DIR="$CTR_FC_BUILD_DIR/cargo_target"
 
-# Full path to the seccompiler cargo target dir, as bind-mounted in the container.
-CTR_CARGO_SECCOMPILER_TARGET_DIR="$CTR_FC_BUILD_DIR/seccompiler"
-
-# Full path to the rebase-snap cargo target dir, as bind-mounted in the container.
-CTR_CARGO_REBASE_SNAP_TARGET_DIR="$CTR_FC_BUILD_DIR/rebase-snap"
-
-# Full path to the microVM images cache dir
-CTR_MICROVM_IMAGES_DIR="$CTR_FC_BUILD_DIR/img"
+# Path to the microVM images cache dir
+MICROVM_IMAGES_DIR="build/img"
 
 # Full path to the public key mapping on the guest
 PUB_KEY_PATH=/root/.ssh/id_rsa.pub
@@ -142,16 +127,11 @@ PRIV_KEY_PATH=/root/.ssh/id_rsa
 # Path to the linux kernel directory, as bind-mounted in the container.
 CTR_KERNEL_DIR="${CTR_FC_ROOT_DIR}/.kernel"
 
-# Global options received by $0
-# These options are not command-specific, so we store them as global vars
-OPT_UNATTENDED=false
-
 # Get the target prefix to avoid repeated calls to uname -m
 TARGET_PREFIX="$(uname -m)-unknown-linux-"
 
-DEFAULT_TEST_SESSION_ROOT_PATH=/srv
-DEFAULT_RAMDISK_PATH=/mnt/devtool-ramdisk
-
+# Container path to directory where we store built CI artifacts.
+CTR_CI_ARTIFACTS_PATH="${CTR_FC_ROOT_DIR}/resources/$(uname -m)"
 
 # Check if Docker is available and exit if it's not.
 # Upon returning from this call, the caller can be certain Docker is available.
@@ -211,7 +191,6 @@ ensure_devctr() {
     # download it, if we don't.
     [[ $(docker images -q "$DEVCTR_IMAGE" | wc -l) -gt 0 ]] || {
         say "About to pull docker image $DEVCTR_IMAGE"
-        get_user_confirmation || die "Aborted."
 
         # Run docker pull 5 times in case it fails - sleep 3 seconds
         # between attempts
@@ -231,46 +210,11 @@ ensure_build_dir() {
     done
 }
 
-build_fc_bin_path() {
+build_bin_path() {
     target="$1"
     profile="$2"
-    echo "$CARGO_TARGET_DIR/$target/$profile/firecracker"
-}
-
-build_jailer_bin_path() {
-    target="$1"
-    profile="$2"
-    echo "$CARGO_TARGET_DIR/$target/$profile/jailer"
-}
-
-build_seccomp_bin_path() {
-    target="$1"
-    profile="$2"
-    echo "$CARGO_SECCOMPILER_TARGET_DIR/$target/$profile/seccompiler-bin"
-}
-
-build_rebase_snap_bin_path() {
-    target="$1"
-    profile="$2"
-    echo "$CARGO_REBASE_SNAP_TARGET_DIR/$target/$profile/rebase-snap"
-}
-
-ensure_release_binaries_exist() {
-    target=$1
-    profile=$2
-    firecracker_bin_path=$( build_fc_bin_path "$target" "$profile")
-    jailer_bin_path=$( build_jailer_bin_path "$target" "$profile")
-    seccompiler_bin_path=$( build_seccomp_bin_path "$target" "$profile")
-    rebase_snap_bin_path=$( build_rebase_snap_bin_path "$target" "$profile")
-
-    { [ -f "$firecracker_bin_path" ] && [ -f "$jailer_bin_path" ] && [ -f "$seccompiler_bin_path" ] && \
-    [ -f "$rebase_snap_bin_path" ]; } || \
-    die "Missing release binaries. Needed files:\n" \
-    "* $firecracker_bin_path\n" \
-    "* $jailer_bin_path\n" \
-    "* $seccompiler_bin_path\n" \
-    "* $rebase_snap_bin_path\n" \
-    "To build the binaries, run:\n\t$0 build --$profile"
+    binary="$3"
+    echo "$CARGO_TARGET_DIR/$target/$profile/$binary"
 }
 
 # Fix build/ dir permissions after a privileged container run.
@@ -282,8 +226,9 @@ cmd_fix_perms() {
     # Yes, running Docker to get elevated privileges, just to chown some files
     # is a dirty hack.
     run_devctr \
+        --workdir "$CTR_FC_ROOT_DIR" \
         -- \
-        chown -R "$(id -u):$(id -g)" "$CTR_FC_BUILD_DIR"
+        chown -f -R "$(id -u):$(id -g)" "$CTR_FC_BUILD_DIR" "$CTR_TEST_RESULTS_DIR" "$CTR_CI_ARTIFACTS_PATH"
 }
 
 # Builds the development container from its Dockerfile.
@@ -359,7 +304,10 @@ run_devctr() {
         --rm \
         --volume /dev:/dev \
         --volume "$FC_ROOT_DIR:$CTR_FC_ROOT_DIR:z" \
-        --env OPT_LOCAL_IMAGES_PATH="$(dirname "$CTR_MICROVM_IMAGES_DIR")" \
+        --volume "$FC_ROOT_DIR/build/cargo_registry:/usr/local/rust/registry:z" \
+        --volume "$FC_ROOT_DIR/build/cargo_git_registry:/usr/local/rust/git:z" \
+        --tmpfs /srv:exec,dev,size=32G \
+        -v /boot:/boot \
         --env PYTHONDONTWRITEBYTECODE=1 \
         "$DEVCTR_IMAGE" "${ctr_args[@]}"
 }
@@ -398,7 +346,7 @@ cmd_help() {
     echo ""
     echo "Available commands:"
     echo ""
-    echo "    build [--debug|--release] [-l|--libc musl|gnu] [-- [<cargo args>]]"
+    echo "    build [--debug|--release] [-l|--libc musl|gnu]"
     echo "        Build the Firecracker binaries."
     echo "        Firecracker is built using the Rust build system (cargo). All arguments after --"
     echo "        will be passed through to cargo."
@@ -413,22 +361,8 @@ cmd_help() {
     echo "    build_devctr"
     echo "        Builds the development container from its Dockerfile."
     echo ""
-    echo "    build_kernel -c|--config [-n|--nproc]"
-    echo "        Builds a kernel image custom-tailored for our CI."
-    echo "        -c, --config  Path to the config file."
-    echo "        -n, --nproc  Number of cores to use for building kernel."
-    echo "    build_rootfs -s|--size [--partuuid]"
-    echo "        Builds a rootfs image custom-tailored for use in our CI."
-    echo "        -s, --size      Size of the rootfs image. Defaults to 300MB.
-                                  The format is the same as that of 'truncates'."
-    echo "        -p, --partuuid  Whether to build a partuuid image."
-    echo ""
     echo "    checkenv"
     echo "        Performs prerequisites checks needed to execute firecracker."
-    echo ""
-    echo "    create_snapshot_artifacts"
-    echo "        Runs a tool that generates snapshot artifacts for supported kernel versions."
-    echo "        Snapshot mem and state files are saved under \`snapshot_artifacts/\` directory"
     echo ""
     echo "    distclean"
     echo "        Clean up the build tree and remove the docker container."
@@ -463,18 +397,43 @@ cmd_help() {
     echo "                            Running Firecracker via the jailer requires elevated"
     echo "                            privileges, though the build phase does not."
     echo ""
+    echo "    sh CMD..."
+    echo "        Launch the development container and run a command."
+    echo ""
     echo "    test [-- [<pytest args>]]"
     echo "        Run the Firecracker integration tests."
     echo "        The Firecracker testing system is based on pytest. All arguments after --"
     echo "        will be passed through to pytest."
     echo "        -c, --cpuset-cpus cpulist    Set a dedicated cpulist to be used by the tests."
     echo "        -m, --cpuset-mems memlist    Set a dedicated memlist to be used by the tests."
-    echo "        -r, --ramdisk size[k|m|g]    Use a ramdisk of 'size' MB for
-                                               the entire test session (e.g
-                                               stored artifacts, Firecracker
-                                               binaries, logs/metrics FIFOs
-                                               and test created device files)."
+    echo "            --performance            Tweak various setting of the host running the tests (such as C- and P-states)"
+    echo "                                     to achieve consistent performance. Used for running performance tests in CI."
     echo ""
+    echo "    build_ci_artifacts [all|rootfs|kernels]"
+    echo "        Builds the rootfs and guest kernel artifacts we use for our CI."
+    echo "        Run './tools/devtool build_ci_artifacts help' for more details about the available commands."
+    echo ""
+    echo "    download_ci_artifacts [--force]"
+    echo "        Downloads the CI artifacts used for testing from our S3 bucket. If --force is passed, purges any existing"
+    echo "        artifacts first. Useful for refreshing local artifacts after an update, or if something got messed up."
+    echo ""
+
+    cat <<EOF
+    test_debug [-- [<pytest args>]]
+        Run tests in a debugging environment
+
+    sandbox
+        Run Firecracker in an IPython REPL (in devctr)
+
+    sandbox_native
+        Run Firecracker in an IPython REPL (AL2023/Ubuntu)
+
+    mkdocs
+        Use 'cargo doc' to generate rustdoc documentation
+
+    checkstyle
+        Run style checks
+EOF
 }
 
 
@@ -486,12 +445,14 @@ cmd_build() {
     profile="debug"
     libc="musl"
 
+
     # Parse any command line args.
     while [ $# -gt 0 ]; do
         case "$1" in
             "-h"|"--help")  { cmd_help; exit 1;     } ;;
             "--debug")      { profile="debug";      } ;;
             "--release")    { profile="release";    } ;;
+            "--rev")       { shift; revision=$1; } ;;
             "--ssh-keys")
                 shift
                 [[ -z "$1" ]] && \
@@ -529,22 +490,49 @@ cmd_build() {
         extra_args="--volume $host_pub_key_path:$PUB_KEY_PATH:z \
                     --volume $host_priv_key_path:$PRIV_KEY_PATH:z"
 
+    workdir="$CTR_FC_ROOT_DIR"
+    if [ ! -z "$revision" ]; then
+      commitish="$revision"
+      if ! git cat-file -t "$commitish"; then commitish=origin/"$revision"; fi
+      branch_name=tmp-$commitish
+
+      tmp_dir=$(mktemp -d)
+
+      git branch $branch_name $commitish
+      git clone -b $branch_name . $tmp_dir
+      pushd $tmp_dir
+      workdir=$tmp_dir
+      extra_args="$extra_args --volume $tmp_dir:$tmp_dir:z"
+    fi
+
     # Run the cargo build process inside the container.
     # We don't need any special privileges for the build phase, so we run the
     # container as the current user/group.
     run_devctr \
-        --user "$(id -u):$(id -g)" \
-        --workdir "$CTR_FC_ROOT_DIR" \
+        --privileged \
+        --workdir "$workdir" \
         ${extra_args} \
         -- \
         ./tools/release.sh --libc $libc --profile $profile
     ret=$?
+
+    # Running as root would have created some root-owned files under the build
+    # dir. Let's fix that.
+    cmd_fix_perms
+
+    if [ ! -z "$revision" ]; then
+      popd
+      git branch -D $branch_name
+      mkdir -p build/"$revision"
+      cp $tmp_dir/build/cargo_target/$(uname -m)-unknown-linux-$libc/$profile/* build/"$revision"
+      cmd_sh "rm -rf $tmp_dir"
+    fi
+
     return $ret
 }
 
 function cmd_make_release {
-    cmd_test -- --json-report --json-report-file=test-report.json || die "Tests failed!"
-
+    ensure_build_dir
     run_devctr \
         --user "$(id -u):$(id -g)" \
         --workdir "$CTR_FC_ROOT_DIR" \
@@ -570,39 +558,133 @@ cmd_distclean() {
     fi
 }
 
-mount_ramdisk() {
-    local ramdisk_size="$1"
-    umount_ramdisk
-    DEFAULT_RAMDISK_PATH=$(sudo mktemp -d /mnt/devtool-ramdisk.XXXXXX)
-    ok_or_die "Could not create ramdisk directory"
-    sudo mkdir -p ${DEFAULT_RAMDISK_PATH} && \
-    sudo mount -t tmpfs -o size=${ramdisk_size} tmpfs ${DEFAULT_RAMDISK_PATH}
-    ok_or_die "Failed to mount ramdisk to ${DEFAULT_RAMDISK_PATH}. Check the permission."
-    sudo mkdir -p ${DEFAULT_RAMDISK_PATH}/srv
-    sudo mkdir -p  ${DEFAULT_RAMDISK_PATH}/tmp
+cmd_download_ci_artifacts() {
+    if [ "$1" = "--force" ]; then
+        rm -rf $FC_BUILD_DIR/img
+    fi
 
-    say "Using ramdisk: ${DEFAULT_RAMDISK_PATH}"
+    ensure_ci_artifacts
 }
 
-umount_ramdisk() {
-    if [ ! -e "${DEFAULT_RAMDISK_PATH}" ]; then
-        return 0
+ensure_ci_artifacts() {
+    if ! command -v aws >/dev/null; then
+      die "AWS CLI not installed, which is required for downloading artifacts for integration tests."
     fi
-    if [ ! -d "${DEFAULT_RAMDISK_PATH}" ]; then
-        die "${DEFAULT_RAMDISK_PATH} is not a directory."
+
+    # Fetch all the artifacts so they are local
+    say "Fetching CI artifacts from S3"
+    FC_VERSION=$(cmd_sh "cd src/firecracker/src; cargo pkgid | cut -d# -f2 | cut -d. -f1-2")
+    S3_URL=s3://spec.ccfc.min/firecracker-ci/v$FC_VERSION/$(uname -m)
+    ARTIFACTS=$MICROVM_IMAGES_DIR/$(uname -m)
+    if [ ! -d "$ARTIFACTS" ]; then
+        mkdir -pv $ARTIFACTS
+        aws s3 sync --no-sign-request "$S3_URL" "$ARTIFACTS"
+        cmd_sh "./tools/setup-ci-artifacts.sh"
     fi
-    if [ ! -w "${DEFAULT_RAMDISK_PATH}" ]; then
-        die "Failed to unmount ${DEFAULT_RAMDISK_PATH}. Check the permission."
-    fi
-    sudo umount ${DEFAULT_RAMDISK_PATH} &>/dev/null
-    sudo rmdir ${DEFAULT_RAMDISK_PATH} &>/dev/null
 }
+
+apply_linux_61_tweaks() {
+    KV=$(uname -r)
+    if [[ $KV != 6.1.* ]] || [ $(uname -m) != x86_64 ]; then
+        return
+    fi
+    say "Applying Linux 6.1 boot-time regression mitigations"
+
+    KVM_VENDOR_MOD=$(lsmod |grep -P "^kvm_(amd|intel)" | awk '{print $1}')
+    ITLB_MULTIHIT=/sys/devices/system/cpu/vulnerabilities/itlb_multihit
+    NX_HUGEPAGES=/sys/module/kvm/parameters/nx_huge_pages
+
+    # If m6a/m6i
+    if grep -q "Not affected" $ITLB_MULTIHIT; then
+        echo -e "CPU not vulnerable to iTLB multihit, using kvm.nx_huge_pages=never mitigation"
+        # we need a lock so another process is not running the same thing and to
+        # avoid race conditions.
+        lockfile="/tmp/.linux61_tweaks.lock"
+        set -C # noclobber
+        while true; do
+            if echo "$$" > "$lockfile"; then
+                echo "Successfully acquired lock"
+                if ! grep -q "never" $NX_HUGEPAGES; then
+                    echo "Reloading KVM modules with nx_huge_pages=never"
+                    sudo modprobe -r $KVM_VENDOR_MOD kvm
+                    sudo modprobe kvm nx_huge_pages=never
+                    sudo modprobe $KVM_VENDOR_MOD
+                fi
+                rm "$lockfile"
+                break
+            else
+                sleep 5s
+            fi
+        done
+        tail -v $ITLB_MULTIHIT $NX_HUGEPAGES
+    # else (m5d Skylake and CascadeLake)
+    else
+        echo "CPU vulnerable to iTLB_multihit, checking if favordynmods is enabled"
+        mount |grep cgroup |grep -q favordynmods
+        if [ $? -ne 0 ]; then
+            say_warn "cgroups' favordynmods option not enabled; VM creation performance may be impacted"
+        else
+            echo "favordynmods is enabled"
+        fi
+    fi
+}
+
+
+# Modifies the processors CPU governor and P-state configuration (x86_64 only) for consistent performance. This means
+# - Disable turbo boost (Intel only) by writing 1 to /sys/devices/system/cpu/intel_pstate/no_turbo
+# - Disable turbo boost (AMD only) by writing 0 to /sys/devices/system/cpu/cpufreq/boost
+# - Lock the CPUs' P-state to the highest non-turbo one (Intel only) by writing 100 to /sys/devices/system/cpu/intel_pstate/{min,max}_perf_pct
+# - Set the cpu frequency governor to performance by writing "performance" to /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+apply_performance_tweaks() {
+  # m6a instances do not support the amd_pstate driver (yet), so nothing we can do there
+  if [[ -d /sys/devices/system/cpu/intel_pstate ]]; then
+    # Disable turbo boost. Some of our tests are performance tests, and we want minimum variability wrt processor frequency
+    # See also https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/processor_state_control.html
+    echo 1 |sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo &> /dev/null
+
+    # Save old values to restore later
+    MIN_PERF_PCT=$(cat /sys/devices/system/cpu/intel_pstate/min_perf_pct)
+    MAX_PERF_PCT=$(cat /sys/devices/system/cpu/intel_pstate/max_perf_pct)
+
+    # Force the CPU to continuously stay in the highest, non-turbo P-state. The P-state will determine the
+    # CPU's clock frequency.
+    # https://www.kernel.org/doc/html/v4.12/admin-guide/pm/intel_pstate.html
+    echo 100 |sudo tee /sys/devices/system/cpu/intel_pstate/min_perf_pct &> /dev/null
+    echo 100 |sudo tee /sys/devices/system/cpu/intel_pstate/max_perf_pct &> /dev/null
+  elif [[ -f /sys/devices/system/cpu/cpufreq/boost ]]; then
+    echo 0 |sudo tee /sys/devices/system/cpu/cpufreq/boost &> /dev/null
+  fi
+
+  # The governor is a linux component that can adjust CPU frequency. "performance" tells it to always run CPUs at
+  # their maximum safe frequency. It seems to be the default for Amazon Linux, but it doesn't hurt to make this explicit.
+  # See also https://wiki.archlinux.org/title/CPU_frequency_scaling
+  echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor &> /dev/null
+}
+
+unapply_performance_tweaks() {
+  if [[ -d /sys/devices/system/cpu/intel_pstate ]]; then
+    # reenable turbo boost
+    echo 0 |sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo &> /dev/null
+
+    # restore p-state limits
+    echo $MIN_PERF_PCT |sudo tee /sys/devices/system/cpu/intel_pstate/min_perf_pct &> /dev/null
+    echo $MAX_PERF_PCT |sudo tee /sys/devices/system/cpu/intel_pstate/max_perf_pct &> /dev/null
+  elif [[ -f /sys/devices/system/cpu/cpufreq/boost ]]; then
+    echo 1 | sudo tee /sys/devices/system/cpu/cpufreq/boost &> /dev/null
+  fi
+
+  # We do not reset the governor, as keeping track of each CPUs configured governor is not trivial here. On our CI
+  # instances, the performance governor is current the default anyway (2023/11/14)
+}
+
 
 # `$0 test` - run integration tests
 # Please see `$0 help` for more information.
 #
 cmd_test() {
-
+    do_ab_test=0
+    do_build=1
+    do_kvm_check=1
     # Parse any command line args.
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -615,10 +697,17 @@ cmd_test() {
                 shift
                 local cpuset_mems="$1"
                 ;;
-            "-r"|"--ramdisk")
-                shift
-                local ramdisk_size="$1"
-                local ramdisk=true
+            "--performance")
+                local performance_tweaks=1;
+                ;;
+            "--ab")
+                do_ab_test=1
+                ;;
+            "--no-build")
+                do_build=0
+                ;;
+            "--no-kvm-check")
+                do_kvm_check=0
                 ;;
             "--")               { shift; break;     } ;;
             *)
@@ -629,62 +718,90 @@ cmd_test() {
     done
 
     # Check prerequisites.
-    ensure_kvm
+    [ $do_kvm_check != 0 ] && ensure_kvm
     ensure_devctr
     ensure_build_dir
+    ensure_ci_artifacts
+    [ $do_build != 0 ] && cmd_build --release
+
+    apply_linux_61_tweaks
 
     # If we got to here, we've got all we need to continue.
-    say "$(date -u +'%F %H:%M:%S %Z')"
     say "Kernel version: $(uname -r)"
+    say "$(sed '/^processor.*: 0$/,/^processor.*: 1$/!d; /^processor.*: 1$/d' /proc/cpuinfo)"
+    say "RPM firmware versions: $(rpm -q microcode_ctl amd-ucode-firmware linux-firmware)"
+
+    env |grep -P "^(AWS_EMF_|BUILDKITE|CODECOV_)" > env.list
+    if [[ $performance_tweaks -eq 1 ]]; then
+      if [[ "$(uname --machine)" == "x86_64" ]]; then
+        say "Detected CI and performance tests, tuning CPU frequency scaling and idle states for reduced variability"
+
+        apply_performance_tweaks
+      fi
+
+      # It seems that even if the tests using huge pages run sequentially on ag=1 agents, right-sizing the huge pages
+      # pool to the total number of huge pages used across all tests results in spurious failures with pool depletion
+      # anyway (something else on the host seems to be stealing our huge pages, and we cannot "ear mark" them for
+      # Firecracker processes). Thus, just allocate 4GB of them and call it a day.
+      say "Setting up huge pages pool"
+      num_hugetlbfs_pages=2048
+
+      huge_pages_old=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)
+      huge_pages_new=$(echo $num_hugetlbfs_pages |sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)
+    fi
+
+    if [[ "$huge_pages_new" -ne "$num_hugetlbfs_pages" ]]; then
+      die "Failed to allocate $num_hugetlbfs_pages hugetlbfs pages, only got $huge_pages_new"
+    fi
+
     say "Starting test run ..."
 
-    if [[ $ramdisk = true ]]; then
-        mount_ramdisk ${ramdisk_size}
-        ramdisk_args="--env TMPDIR=${DEFAULT_TEST_SESSION_ROOT_PATH}/tmp --volume ${DEFAULT_RAMDISK_PATH}:${DEFAULT_TEST_SESSION_ROOT_PATH}"
+    test_script="./tools/test.sh"
+
+    if [ $do_ab_test -eq 1 ]; then
+      test_script="./tools/ab_test.py"
     fi
 
     # Testing (running Firecracker via the jailer) needs root access,
     # in order to set-up the Firecracker jail (manipulating cgroups, net
     # namespaces, etc).
     # We need to run a privileged container to get that kind of access.
-    env |grep -P "^(AWS_EMF_|BUILDKITE_)" > env.list
-
     run_devctr \
         --privileged \
         --security-opt seccomp=unconfined \
         --ulimit core=0 \
         --ulimit nofile=4096:4096 \
         --ulimit memlock=-1:-1 \
-        --workdir "$CTR_FC_ROOT_DIR/tests" \
+        --workdir "$CTR_FC_ROOT_DIR" \
         --cpuset-cpus="$cpuset_cpus" \
         --cpuset-mems="$cpuset_mems" \
         --env-file env.list \
-        -v /boot:/boot \
-        ${ramdisk_args} \
         -- \
-        pytest -W error::pytest.PytestUnraisableExceptionWarning -W error::pytest.PytestUnhandledThreadExceptionWarning "$@"
+        $test_script "$@"
 
     ret=$?
 
-    say "$(date -u +'%F %H:%M:%S %Z')"
     say "Finished test run ..."
-
-    if [[ $ramdisk = true ]]; then
-        umount_ramdisk
-    fi
 
     # Running as root would have created some root-owned files under the build
     # dir. Let's fix that.
     cmd_fix_perms
 
-    # Log CPU information
-    say "$(lscpu)"
+    # undo performance tweaks (in case the instance gets recycled for a non-perf test)
+    if [[ $performance_tweaks -eq 1 ]]; then
+      if [[ "$(uname --machine)" == "x86_64" ]]; then
+        unapply_performance_tweaks
+      fi
+
+      echo $huge_pages_old |sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages >/dev/null
+    fi
 
     # do not leave behind env.list file
     rm env.list
 
     return $ret
 }
+
 
 # `$0 shell` - drop to a shell prompt inside the dev container
 # Please see `$0 help` for more information.
@@ -699,12 +816,7 @@ cmd_shell() {
         case "$1" in
             "-h"|"--help")          { cmd_help; exit 1; } ;;
             "-p"|"--privileged")    { privileged=true;  } ;;
-            "-r"|"--ramdisk")
-                  shift
-                  local ramdisk_size="$1"
-                  local ramdisk=true
-                  ;;
-              "--")               { shift; break;     } ;;
+            "--")               { shift; break;     } ;;
             *)
                 die "Unknown argument: $1. Please use --help for help."
             ;;
@@ -715,11 +827,6 @@ cmd_shell() {
     # Make sure we have what we need to continue.
     ensure_devctr
     ensure_build_dir
-
-    if [[ $ramdisk = true ]]; then
-        mount_ramdisk ${ramdisk_size}
-        ramdisk_args="--volume ${DEFAULT_RAMDISK_PATH}:${DEFAULT_TEST_SESSION_ROOT_PATH}"
-    fi
 
     if [[ $privileged = true ]]; then
         # If requested, spin up a privileged container.
@@ -734,8 +841,6 @@ cmd_shell() {
             --ulimit memlock=-1:-1 \
             --security-opt seccomp=unconfined \
             --workdir "$CTR_FC_ROOT_DIR" \
-            -v /boot:/boot \
-            ${ramdisk_args} \
             -- \
             bash
         ret=$?
@@ -767,68 +872,71 @@ cmd_shell() {
         ret=$?
     fi
 
-    if [[ $ramdisk = true ]]; then
-        umount_ramdisk
-    fi
-
     return $ret
 }
 
-
-cmd_create_snapshot_artifacts() {
-    privileged=true
-
-    # Make sure we have what we need to continue.
-    ensure_devctr
+cmd_sh() {
     ensure_build_dir
-
-    say "Creating snapshot artifacts ..."
     run_devctr \
         --privileged \
         --ulimit nofile=4096:4096 \
         --ulimit memlock=-1:-1 \
-        --security-opt seccomp=unconfined \
         --workdir "$CTR_FC_ROOT_DIR" \
-        ${ramdisk_args} \
         -- \
-        python3 tools/create_snapshot_artifact/main.py
-    ret=$?
-
-    # Running as root may have created some root-owned files under the build
-    # dir. Let's fix that.
-    cmd_fix_perms
-
-    return $ret
+        bash --norc -c "$*"
 }
 
+cmd_sandbox() {
+    cmd_build --release
+    ensure_ci_artifacts
+    cmd_sh "tmux new env PYTEST_ADDOPTS=--pdbcls=IPython.terminal.debugger:TerminalPdb PYTHONPATH=tests IPYTHONDIR=\$PWD/.ipython ipython -i ./tools/sandbox.py $@"
+}
+
+cmd_sandbox_native() {
+    cmd_build --release
+
+    source /etc/os-release
+    case $ID$VERSION_ID in
+        ubuntu22.04)
+            sudo apt install python3-pip python3.11-dev gcc tmux
+            ;;
+        al2023)
+            sudo yum -y install python3.11-pip python3.11-devel gcc tmux
+            ;;
+    esac
+    python3.11 -m venv sandbox
+    source sandbox/bin/activate
+    pip3.11 install ipython requests requests_unixsocket2 psutil tenacity filelock
+    pip3.11 install jsonschema aws_embedded_metrics
+    pip3.11 install packaging pytest
+    ensure_ci_artifacts
+    tmux neww sudo --preserve-env=HOME,PATH,TMUX env PYTHONPATH=tests IPYTHONDIR=\$PWD/.ipython ipython -i ./tools/sandbox.py $@
+}
+
+cmd_test_debug() {
+    ensure_ci_artifacts
+    cmd_sh "tmux new ./tools/test.sh --pdb $@"
+}
 
 # Auto-format all source code, to match the Firecracker requirements. For the
 # moment, this is just a wrapper over `cargo fmt --all`
 # Example: `devtool fmt`
 #
 cmd_fmt() {
-
-    # Parse any command line args.
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            "-h"|"--help")      { cmd_help; exit 1; } ;;
-            *)
-                die "Unknown argument: $1. Please use --help for help."
-            ;;
-        esac
-        shift
-    done
-
-    ensure_devctr
-
-    say "Applying rustfmt ..."
-    run_devctr \
-        --user "$(id -u):$(id -g)" \
-        --workdir "$CTR_FC_ROOT_DIR" \
-        -- \
-        cargo fmt --all
+    cmd_sh "cargo fmt --all -- --config $(tr '\n' ',' <tests/fmt.toml)"
+    cmd_sh "cargo sort"
+    cmd_sh "cd tests; black . ../tools ../.buildkite"
+    cmd_sh "cd tests; isort . ../tools ../.buildkite"
+    cmd_sh "mdformat $(git ls-files '*.md' | tr '\n' ' ')"
 }
 
+cmd_mkdocs() {
+    cmd_sh "cargo doc --workspace --no-deps --document-private-items"
+}
+
+cmd_checkstyle() {
+    cmd_test --no-build --no-kvm-check -- integration_tests/style -n 4 --dist worksteal
+}
 
 # Check if able to run firecracker.
 # ../docs/getting-started.md#prerequisites
@@ -852,66 +960,33 @@ check_kernver () {
 # Check Production Host Setup
 # ../docs/prod-host-setup.md
 
-check_SMT () {
-    (grep -q "^forceoff$\|^notsupported$" \
-      /sys/devices/system/cpu/smt/control) ||
-    say_warn "WARNING: Hyperthreading ENABLED."
-}
-
 check_KPTI () {
     (grep -q "^Mitigation: PTI$" \
       /sys/devices/system/cpu/vulnerabilities/meltdown) || \
-    say_warn "WARNING: KPTI NOT SUPPORTED"
+    say_warn "WARNING: KPTI NOT SUPPORTED."
 }
 
 check_KSM () {
     (grep -q "^0$" /sys/kernel/mm/ksm/run) || \
-    say_warn "WARNING: KSM ENABLED"
+    say_warn "WARNING: KSM ENABLED."
 }
 
-check_IBPB_IBRS () {
-    (grep -q "^Mitigation: Full generic retpoline, IBPB, IBRS_FW$"\
-      /sys/devices/system/cpu/vulnerabilities/spectre_v2) || \
-    say_warn "WARNING: retpoline, IBPB, IBRS: DISABLED."
-}
-
-check_L1TF () {
-    declare -a CONDITIONS=("Mitigation: PTE Inversion" "VMX: cache flushes")
-    for cond in "${CONDITIONS[@]}";
-    do (grep -q "$cond" /sys/devices/system/cpu/vulnerabilities/l1tf) ||
-       say_warn "WARNING: $cond: DISABLED";
+check_vulns () {
+    for f in /sys/devices/system/cpu/vulnerabilities/* ; do
+        if $(grep -q "Vulnerable" ${f}) ; then
+            say_warn "WARNING: `basename $f`: VULNERABLE.";
+        fi
     done
 }
 
 check_swap () {
     (grep -q "swap.img" /proc/swaps ) && \
-    say_warn "WARNING: SWAP ENABLED"
-}
-
-check_SSBD () {
-    arch=$(uname -m)
-    if [ "$arch" = "aarch64" ]; then
-        local param="ssbd=force-on"
-    elif [ "$arch" = "x86_64" ]; then
-        local param="spec_store_bypass_disable=on"
-    fi
-
-    ssbd_sysfs_file="/sys/devices/system/cpu/vulnerabilities/spec_store_bypass"
-
-    if [ -f "$ssbd_sysfs_file" ]; then
-        (grep -q "^Vulnerable" $ssbd_sysfs_file) && \
-        say_warn "WARNING: SSBD mitigation is either globally disabled or"\
-            "system does not support mitigation via prctl or seccomp. Try"\
-            "enabling it system-wide, using the \`${param}\` boot parameter."
-    else
-        say_warn "WARNING: SSBD mitigation not supported on this kernel."\
-            "View the prod-host-setup.md for more details."
-    fi
+    say_warn "WARNING: SWAP ENABLED."
 }
 
 check_EPT() {
-    if [ "$arch" = "x86_64" ]; then
-        (grep -q "Y" /sys/module/kvm_intel/parameters/ept) || \
+    if [ "$(uname --machine)" = "x86_64" ]; then
+        (grep -q "Y" /sys/module/kvm_intel/parameters/ept ; [ $? -ne 1 ]) || \
         say_warn "WARNING: EPT DISABLED. Performance will be affected."
     fi
 }
@@ -944,12 +1019,9 @@ cmd_checkenv() {
     say "Checking Host Security Configuration."
     say "Please check $PROD_DOC in case of any error."
     check_KSM
-    check_IBPB_IBRS
-    check_L1TF
-    check_SMT
     check_swap
-    check_SSBD
     check_EPT
+    check_vulns
 }
 
 generate_syscall_table_x86_64() {
@@ -1088,6 +1160,7 @@ cmd_install() {
     profile="release"
     target="$TARGET_PREFIX""musl"
     install_path="/usr/local/bin"
+    binaries=("firecracker" "jailer" "seccompiler-bin" "rebase-snap" "cpu-template-helper")
 
     # Parse any command line args.
     while [ $# -gt 0 ]; do
@@ -1107,160 +1180,35 @@ cmd_install() {
     done
 
     # Check that the binaries exist first
-    ensure_release_binaries_exist $target $profile
-
-    say "Installing firecracker in $install_path"
-    install -m 755 "$( build_fc_bin_path "$target" "$profile")" "$install_path"
-
-    say "Installing jailer in $install_path"
-    install -m 755 "$( build_jailer_bin_path "$target" "$profile")" "$install_path"
-
-    say "Installing seccomp in $install_path"
-    install -m 755 "$( build_seccomp_bin_path "$target" "$profile")" "$install_path"
-
-    say "Installing rebase-snap in $install_path"
-    install -m 755 "$( build_rebase_snap_bin_path "$target" "$profile")" "$install_path"
-}
-
-# Build a Firecracker CI compatible kernel image.
-# Example: `./tools/devtool build_kernel -c resources/guest_configs/microvm-kernel-arm64-4.14.config`
-#
-cmd_build_kernel() {
-    nprocs=$(getconf _NPROCESSORS_ONLN)
-
-    # Parse any command line args.
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            "-h"|"--help")      { cmd_help; exit 1; } ;;
-            "-c"|"--config")
-                shift
-                kernel_config="$1"
-                ;;
-            "-n"|"--nproc")
-                shift
-                nprocs="$1"
-                ;;
-            *)
-                die "Unknown argument: $1. Please use --help for help."
-            ;;
-        esac
-        shift
+    for binary in "${binaries[@]}"; do
+        bin_path=$( build_bin_path "$target" "$profile" "$binary" )
+        if [ ! -f "$bin_path" ]; then
+            die "Missing release binary. Needed file: $bin_path\n"\
+            "To build the binaries, run:\n\t$0 build --$profile"
+        fi
     done
 
-    # It is mandatory to provide a valid config file for building the kernel.
-    [ -z "$kernel_config" ] && die "You need to provide the path to a valid kernel config!"
+    # Install the binaries
+    for binary in "${binaries[@]}"; do
+        say "Installing $binary in $install_path"
+        install -m 755 -D -t "$install_path" "$( build_bin_path "$target" "$profile" "$binary" )"
+    done
+}
 
+cmd_build_ci_artifacts() {
+    # Check prerequisites
+    ensure_devctr
+
+    # We need to run nested Docker here, so run this container as privileged.
     run_devctr \
-        --user "$(id -u):$(id -g)" \
-        -- sh -c "resources/tests/build_kernel.sh $kernel_config $nprocs"
-    ok_or_die "Could not build kernel."
-    say "Successfully built kernel!"
-}
-
-# `./devtool build_rootfs -s 500M`
-# Build a rootfs of custom size.
-#
-cmd_build_rootfs() {
-    # Default size for the resulting rootfs image is 300M.
-    SIZE="300M"
-    FROM_CTR=ubuntu:22.04
-    flavour="jammy"
-    ROOTFS_DIR=/firecracker/build/rootfs
-    MNT_DIR=$ROOTFS_DIR/mnt
-
-    # Parse the command line args.
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            "-h"|"--help")      { cmd_help; exit 1; } ;;
-            "-s"|"--size")
-                shift
-                SIZE="$1"
-                ;;
-            "-p"|"--partuuid")
-                shift
-                PARTUUID=1
-                ;;
-            "-m"|"--mount")
-                shift
-                MNT_DIR="$1"
-                ;;
-            *)
-                die "Unknown argument: $1. Please use --help for help."
-            ;;
-        esac
-        shift
-    done
-
-    rootfs_dir_host="$FC_BUILD_DIR/rootfs"
-    rootfs_dir_ctr="$CTR_FC_BUILD_DIR/rootfs"
-    resources_dir_ctr="$CTR_FC_ROOT_DIR/resources/tests"
-    ROOTFS_NAME="$flavour.rootfs.ext4"
-    ROOTFS_PARTUUID_NAME="$flavour.rootfs_with_partuuid.ext4"
-
-    create_dir "$rootfs_dir_host"
-
-    docker run --privileged --rm -i -v "$FC_ROOT_DIR:/firecracker" "$FROM_CTR" bash -s <<EOF
-apt-get update && \
-apt-get install -y gcc && \
-gcc -o $rootfs_dir_ctr/init $resources_dir_ctr/init.c && \
-gcc -o $rootfs_dir_ctr/fillmem $resources_dir_ctr/fillmem.c && \
-gcc -o $rootfs_dir_ctr/readmem $resources_dir_ctr/readmem.c
-EOF
-
-    img_file="$rootfs_dir_host/$ROOTFS_NAME"
-
-    # Check for pre-existence of rootfs image. See if we are allowed
-    # to delete it. If not, abort.
-    if [ -f "$img_file" ]; then
-        say "Rootfs image $img_file already exists. Do you want us to delete it for you?"
-        get_user_confirmation || die "Aborted."
-        rm -f "$img_file"
-    fi
-
-    truncate -s "$SIZE" "$img_file"
-    mkfs.ext4 -F "$img_file"
-    docker run --env ROOTFS_DIR="$ROOTFS_DIR" --env MNT_DIR="$MNT_DIR" --env ROOTFS_NAME=$ROOTFS_NAME --env PARTUUID=$PARTUUID --privileged --rm -i -v "$FC_ROOT_DIR:/firecracker"  "$FROM_CTR" bash -s <<'EOF'
-img_file="$ROOTFS_DIR/$ROOTFS_NAME"
-resource_dir="/firecracker/resources/tests"
-mnt_dir="$MNT_DIR"
-dirs="bin etc home lib lib64 opt root sbin usr"
-
-source $resource_dir/setup_rootfs.sh
-
-mkdir -p $mnt_dir
-echo "Mounting $img_file on $mnt_dir ..."
-mount $img_file $mnt_dir
-
-prepare_fc_rootfs "$ROOTFS_DIR" "$resource_dir"
-
-# If we want to create a PARTUUID no need to install all packages (i.e cpuid, iperf3).
-if [ -z "$PARTUUID" ]; then
-    setup_specialized_rootfs "$ROOTFS_DIR" "$resource_dir"
-    dirs="$dirs dev"
-fi
-
-# Copy everything we need to the bind-mounted rootfs image file
-for d in $dirs; do tar c "/$d" | tar x -C $mnt_dir; done
-umount $mnt_dir
-
-EOF
-
-    if [ -n "$PARTUUID" ]; then
-        say "Now creating partuuid enabled rootfs..."
-
-        run_devctr \
         --privileged \
-        --workdir "$FC_DEVCTR_DIR" \
-        -- /bin/bash -c "source "$CTR_FC_ROOT_DIR/resources/tests/setup_rootfs.sh" && create_partuuid_rootfs "$rootfs_dir_ctr/$ROOTFS_NAME" "$rootfs_dir_ctr/$ROOTFS_PARTUUID_NAME"" || die "Error while building partuuid enabled root!"
-        label=$(blkid "$rootfs_dir_host/$ROOTFS_PARTUUID_NAME" | cut -d ' ' -f 2 | cut -d '=' -f 2)
-        say "Created partuuid enabled disk with partition label: $label!"
-        rm "$img_file"
-        img_file="$rootfs_dir_host/$ROOTFS_PARTUUID_NAME"
-    fi
+        --workdir "$CTR_FC_ROOT_DIR" \
+        -- \
+        ./resources/rebuild.sh "$@"
 
-    say "Successfully built rootfs!"
-    say "Rootfs image binary and private key placed in $img_file and $rootfs_dir_host/ssh/id_rsa, respectively!"
+    cmd_fix_perms
 }
+
 
 main() {
 
@@ -1273,7 +1221,8 @@ main() {
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help)              { cmd_help; exit 1;     } ;;
-            -y|--unattended)        { OPT_UNATTENDED=true;  } ;;
+            -y|--unattended)        # purposefully ignored
+                ;;
             -*)
                 die "Unknown arg: $1. Please use \`$0 help\` for help."
             ;;

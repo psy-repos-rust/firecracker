@@ -1,21 +1,19 @@
 # Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Tests that verify the jailer's behavior."""
-import functools
+
 import http.client as http_client
 import os
 import resource
 import stat
 import subprocess
 import time
+from pathlib import Path
 
-import psutil
 import pytest
 import requests
 import urllib3
 
-import host_tools.cargo_build as build_tools
-from framework.builder import SnapshotBuilder
 from framework.defs import FC_BINARY_NAME
 from framework.jailer import JailerContext
 
@@ -54,64 +52,38 @@ def check_stats(filepath, stats, uid, gid):
     assert st.st_mode ^ stats == 0
 
 
-def test_default_chroot(test_microvm_with_api):
-    """
-    Test that the jailer assigns a default chroot if none is specified.
-
-    @type: security
-    """
-    test_microvm = test_microvm_with_api
-
-    # Start customizing arguments.
-    # Test that firecracker's default chroot folder is indeed `/srv/jailer`.
-    test_microvm.jailer.chroot_base = None
-
-    test_microvm.spawn()
-
-    # Test the expected outcome.
-    assert os.path.exists(test_microvm.jailer.api_socket_path())
-
-
-def test_empty_jailer_id(test_microvm_with_api):
+def test_empty_jailer_id(uvm_plain):
     """
     Test that the jailer ID cannot be empty.
-
-    @type: security
     """
-    test_microvm = test_microvm_with_api
-    fc_binary, _ = build_tools.get_firecracker_binaries()
+    test_microvm = uvm_plain
 
     # Set the jailer ID to None.
     test_microvm.jailer = JailerContext(
         jailer_id="",
-        exec_file=fc_binary,
+        exec_file=test_microvm.fc_binary_path,
     )
 
-    # pylint: disable=W0703
-    try:
+    # If the exception is not thrown, it means that Firecracker was
+    # started successfully, hence there's a bug in the code due to which
+    # we can set an empty ID.
+    with pytest.raises(
+        ChildProcessError,
+        match=r"Jailer error: Invalid instance ID: Invalid len \(0\);  the length must be between 1 and 64",
+    ):
         test_microvm.spawn()
-        # If the exception is not thrown, it means that Firecracker was
-        # started successfully, hence there's a bug in the code due to which
-        # we can set an empty ID.
-        assert False
-    except Exception as err:
-        expected_err = (
-            "Jailer error: Invalid instance ID: Invalid len (0);"
-            "  the length must be between 1 and 64"
-        )
-        assert expected_err in str(err)
 
 
-def test_exec_file_not_exist(test_microvm_with_api, tmp_path):
+def test_exec_file_not_exist(uvm_plain, tmp_path):
     """
     Test the jailer option `--exec-file`
-
-    @type: security
     """
-    test_microvm = test_microvm_with_api
+    test_microvm = uvm_plain
 
     # Error case 1: No such file exists
     pseudo_exec_file_path = tmp_path / "pseudo_firecracker_exec_file"
+    fc_dir = Path("/srv/jailer") / pseudo_exec_file_path.name / test_microvm.id
+    fc_dir.mkdir(parents=True, exist_ok=True)
     test_microvm.jailer.exec_file = pseudo_exec_file_path
 
     with pytest.raises(
@@ -124,6 +96,8 @@ def test_exec_file_not_exist(test_microvm_with_api, tmp_path):
     # Error case 2: Not a file
     pseudo_exec_dir_path = tmp_path / "firecracker_test_dir"
     pseudo_exec_dir_path.mkdir()
+    fc_dir = Path("/srv/jailer") / pseudo_exec_dir_path.name / test_microvm.id
+    fc_dir.mkdir(parents=True, exist_ok=True)
     test_microvm.jailer.exec_file = pseudo_exec_dir_path
 
     with pytest.raises(
@@ -135,6 +109,8 @@ def test_exec_file_not_exist(test_microvm_with_api, tmp_path):
     # Error case 3: Filename without "firecracker"
     pseudo_exec_file_path = tmp_path / "foobarbaz"
     pseudo_exec_file_path.touch()
+    fc_dir = Path("/srv/jailer") / pseudo_exec_file_path.name / test_microvm.id
+    fc_dir.mkdir(parents=True, exist_ok=True)
     test_microvm.jailer.exec_file = pseudo_exec_file_path
 
     with pytest.raises(
@@ -145,13 +121,11 @@ def test_exec_file_not_exist(test_microvm_with_api, tmp_path):
         test_microvm.spawn()
 
 
-def test_default_chroot_hierarchy(test_microvm_with_initrd):
+def test_default_chroot_hierarchy(uvm_plain):
     """
     Test the folder hierarchy created by default by the jailer.
-
-    @type: security
     """
-    test_microvm = test_microvm_with_initrd
+    test_microvm = uvm_plain
 
     test_microvm.spawn()
 
@@ -198,13 +172,11 @@ def test_default_chroot_hierarchy(test_microvm_with_initrd):
     )
 
 
-def test_arbitrary_usocket_location(test_microvm_with_initrd):
+def test_arbitrary_usocket_location(uvm_plain):
     """
     Test arbitrary location scenario for the api socket.
-
-    @type: security
     """
-    test_microvm = test_microvm_with_initrd
+    test_microvm = uvm_plain
     test_microvm.jailer.extra_args = {"api-sock": "api.socket"}
 
     test_microvm.spawn()
@@ -217,65 +189,38 @@ def test_arbitrary_usocket_location(test_microvm_with_initrd):
     )
 
 
-@functools.lru_cache(maxsize=None)
-def cgroup_v2_available():
-    """Check if cgroup-v2 is enabled on the system."""
-    # https://rootlesscontaine.rs/getting-started/common/cgroup2/#checking-whether-cgroup-v2-is-already-enabled
-    return os.path.isfile("/sys/fs/cgroup/cgroup.controllers")
+class Cgroups:
+    """Helper class to work with cgroups"""
+
+    def __init__(self):
+        self.root = Path("/sys/fs/cgroup")
+        self.version = 2
+        # https://rootlesscontaine.rs/getting-started/common/cgroup2/#checking-whether-cgroup-v2-is-already-enabled
+        if not self.root.joinpath("cgroup.controllers").exists():
+            self.version = 1
+
+    def new_cgroup(self, cgname):
+        """Create a new cgroup"""
+        self.root.joinpath(cgname).mkdir(parents=True, exist_ok=True)
+
+    def move_pid(self, cgname, pid):
+        """Move a PID to a cgroup"""
+        cg_pids = self.root.joinpath(f"{cgname}/cgroup.procs")
+        cg_pids.write_text(f"{pid}\n", encoding="ascii")
 
 
-@pytest.fixture
-def sys_setup_cgroups():
-    """Configure cgroupfs in order to run the tests.
-
-    This fixture sets up the cgroups on the system to enable processes
-    spawned by the tests be able to create cgroups successfully.
-    This set-up is important to do when running from inside a Docker
-    container while the system is using cgroup-v2.
-    """
-    cgroup_version = 2 if cgroup_v2_available() else 1
-    if cgroup_version == 2:
-        # Cgroup-v2 adds a no internal process constraint which means that
-        # non-root cgroups can distribute domain resources to their children
-        # only when they don’t have any processes of their own.
-        # When a Docker container is created, the processes running inside
-        # the container are added to a cgroup which the container sees
-        # as the root cgroup. This prevents creation of using domain cgroups.
-        cgroup_root = None
-
-        # find the group-v2 mount point
-        with open("/proc/mounts", encoding="utf-8") as proc_mounts:
-            mounts = proc_mounts.readlines()
-            for line in mounts:
-                if "cgroup2" in line:
-                    cgroup_root = line.split(" ")[1]
-        assert cgroup_root
-
-        # the root cgroup on the host would not contain the "cgroup.type" file
-        # if the root cgroup contains this file this means that a new
-        # namespace was created and this container was switched to that
-        if os.path.exists(f"{cgroup_root}/cgroup.type"):
-            root_procs = []
-            # get all the processes that were added in the root cgroup
-            with open(f"{cgroup_root}/cgroup.procs", encoding="utf-8") as procs:
-                root_procs = [x.strip() for x in procs.readlines()]
-
-            # now create a new domain cgroup and migrate the processes
-            # to that cgroup
-            os.makedirs(f"{cgroup_root}/system", exist_ok=True)
-            for pid in root_procs:
-                with open(
-                    f"{cgroup_root}/system/cgroup.procs", "a", encoding="utf-8"
-                ) as sys_procs:
-                    sys_procs.write(str(pid))
-            # at this point there should be no processes added to internal
-            # cgroup nodes so new domain cgroups can be created starting
-            # from the root cgroup
-    yield cgroup_version
+@pytest.fixture(scope="session", autouse=True)
+def cgroups_info():
+    """Return a fixture with the cgroups available in the system"""
+    return Cgroups()
 
 
-def check_cgroups_v1(cgroups, cgroup_location, jailer_id, parent_cgroup=FC_BINARY_NAME):
+def check_cgroups_v1(cgroups, jailer_id, parent_cgroup=FC_BINARY_NAME):
     """Assert that every cgroupv1 in cgroups is correctly set."""
+    # We assume sysfs cgroups are mounted here.
+    cgroup_location = "/sys/fs/cgroup"
+    assert os.path.isdir(cgroup_location)
+
     for cgroup in cgroups:
         controller = cgroup.split(".")[0]
         file_name, value = cgroup.split("=")
@@ -289,55 +234,43 @@ def check_cgroups_v1(cgroups, cgroup_location, jailer_id, parent_cgroup=FC_BINAR
         assert open(tasks_file, "r", encoding="utf-8").readline().strip().isdigit()
 
 
-def check_cgroups_v2(cgroups, cgroup_location, jailer_id, parent_cgroup=FC_BINARY_NAME):
+def check_cgroups_v2(vm):
     """Assert that every cgroupv2 in cgroups is correctly set."""
-    cg_locations = {
-        "root": f"{cgroup_location}",
-        "fc": f"{cgroup_location}/{parent_cgroup}",
-        "jail": f"{cgroup_location}/{parent_cgroup}/{jailer_id}",
-    }
-    for cgroup in cgroups:
+    cg = Cgroups()
+    assert cg.root.is_dir()
+    parent_cgroup = vm.jailer.parent_cgroup
+    if parent_cgroup is None:
+        parent_cgroup = FC_BINARY_NAME
+    cg_parent = cg.root / parent_cgroup
+    cg_jail = cg_parent / vm.jailer.jailer_id
+
+    # if no cgroups were specified, then the jailer should move the FC process
+    # to the parent group
+    if len(vm.jailer.cgroups) == 0:
+        procs = cg_parent.joinpath("cgroup.procs").read_text().splitlines()
+        assert str(vm.firecracker_pid) in procs
+
+    for cgroup in vm.jailer.cgroups:
         controller = cgroup.split(".")[0]
         file_name, value = cgroup.split("=")
-        procs_file = f'{cg_locations["jail"]}/cgroup.procs'
-        file = f'{cg_locations["jail"]}/{file_name}'
+        procs = cg_jail.joinpath("cgroup.procs").read_text().splitlines()
+        file = cg_jail / file_name
 
-        assert (
-            controller
-            in open(f'{cg_locations["root"]}/cgroup.controllers', "r", encoding="utf-8")
-            .readline()
-            .strip()
-        )
-        assert (
-            controller
-            in open(
-                f'{cg_locations["root"]}/cgroup.subtree_control', "r", encoding="utf-8"
+        assert file.read_text().strip() == value
+
+        assert all(x.isnumeric() for x in procs)
+        assert str(vm.firecracker_pid) in procs
+
+        for cgroup in [cg.root, cg_parent, cg_jail]:
+            assert controller in cgroup.joinpath("cgroup.controllers").read_text(
+                encoding="ascii"
             )
-            .readline()
-            .strip()
-        )
-        assert (
-            controller
-            in open(f'{cg_locations["fc"]}/cgroup.controllers', "r", encoding="utf-8")
-            .readline()
-            .strip()
-        )
-        assert (
-            controller
-            in open(
-                f'{cg_locations["fc"]}/cgroup.subtree_control', "r", encoding="utf-8"
+            # don't check since there are no children cgroups
+            if cgroup == cg_jail:
+                continue
+            assert controller in cgroup.joinpath("cgroup.subtree_control").read_text(
+                encoding="ascii"
             )
-            .readline()
-            .strip()
-        )
-        assert (
-            controller
-            in open(f'{cg_locations["jail"]}/cgroup.controllers', "r", encoding="utf-8")
-            .readline()
-            .strip()
-        )
-        assert open(file, "r", encoding="utf-8").readline().strip() == value
-        assert open(procs_file, "r", encoding="utf-8").readline().strip().isdigit()
 
 
 def get_cpus(node):
@@ -362,15 +295,12 @@ def check_limits(pid, no_file, fsize):
     assert hard == fsize
 
 
-def test_cgroups(test_microvm_with_initrd, sys_setup_cgroups):
+def test_cgroups(uvm_plain, cgroups_info):
     """
     Test the cgroups are correctly set by the jailer.
-
-    @type: security
     """
-    # pylint: disable=redefined-outer-name
-    test_microvm = test_microvm_with_initrd
-    test_microvm.jailer.cgroup_ver = sys_setup_cgroups
+    test_microvm = uvm_plain
+    test_microvm.jailer.cgroup_ver = cgroups_info.version
     if test_microvm.jailer.cgroup_ver == 2:
         test_microvm.jailer.cgroups = ["cpu.weight.nice=10"]
     else:
@@ -387,29 +317,18 @@ def test_cgroups(test_microvm_with_initrd, sys_setup_cgroups):
 
     test_microvm.spawn()
 
-    # We assume sysfs cgroups are mounted here.
-    sys_cgroup = "/sys/fs/cgroup"
-    assert os.path.isdir(sys_cgroup)
-
     if test_microvm.jailer.cgroup_ver == 1:
-        check_cgroups_v1(
-            test_microvm.jailer.cgroups, sys_cgroup, test_microvm.jailer.jailer_id
-        )
+        check_cgroups_v1(test_microvm.jailer.cgroups, test_microvm.jailer.jailer_id)
     else:
-        check_cgroups_v2(
-            test_microvm.jailer.cgroups, sys_cgroup, test_microvm.jailer.jailer_id
-        )
+        check_cgroups_v2(test_microvm)
 
 
-def test_cgroups_custom_parent(test_microvm_with_initrd, sys_setup_cgroups):
+def test_cgroups_custom_parent(uvm_plain, cgroups_info):
     """
     Test cgroups when a custom parent cgroup is used.
-
-    @type: security
     """
-    # pylint: disable=redefined-outer-name
-    test_microvm = test_microvm_with_initrd
-    test_microvm.jailer.cgroup_ver = sys_setup_cgroups
+    test_microvm = uvm_plain
+    test_microvm.jailer.cgroup_ver = cgroups_info.version
     test_microvm.jailer.parent_cgroup = "custom_cgroup/group2"
     if test_microvm.jailer.cgroup_ver == 2:
         test_microvm.jailer.cgroups = ["cpu.weight=2"]
@@ -426,35 +345,22 @@ def test_cgroups_custom_parent(test_microvm_with_initrd, sys_setup_cgroups):
 
     test_microvm.spawn()
 
-    # We assume sysfs cgroups are mounted here.
-    sys_cgroup = "/sys/fs/cgroup"
-    assert os.path.isdir(sys_cgroup)
-
     if test_microvm.jailer.cgroup_ver == 1:
         check_cgroups_v1(
             test_microvm.jailer.cgroups,
-            sys_cgroup,
             test_microvm.jailer.jailer_id,
             test_microvm.jailer.parent_cgroup,
         )
     else:
-        check_cgroups_v2(
-            test_microvm.jailer.cgroups,
-            sys_cgroup,
-            test_microvm.jailer.jailer_id,
-            test_microvm.jailer.parent_cgroup,
-        )
+        check_cgroups_v2(test_microvm)
 
 
-def test_node_cgroups(test_microvm_with_initrd, sys_setup_cgroups):
+def test_node_cgroups(uvm_plain, cgroups_info):
     """
     Test the numa node cgroups are correctly set by the jailer.
-
-    @type: security
     """
-    # pylint: disable=redefined-outer-name
-    test_microvm = test_microvm_with_initrd
-    test_microvm.jailer.cgroup_ver = sys_setup_cgroups
+    test_microvm = uvm_plain
+    test_microvm.jailer.cgroup_ver = cgroups_info.version
 
     # Retrieve CPUs from NUMA node 0.
     node_cpus = get_cpus(0)
@@ -464,29 +370,18 @@ def test_node_cgroups(test_microvm_with_initrd, sys_setup_cgroups):
 
     test_microvm.spawn()
 
-    # We assume sysfs cgroups are mounted here.
-    sys_cgroup = "/sys/fs/cgroup"
-    assert os.path.isdir(sys_cgroup)
-
     if test_microvm.jailer.cgroup_ver == 1:
-        check_cgroups_v1(
-            test_microvm.jailer.cgroups, sys_cgroup, test_microvm.jailer.jailer_id
-        )
+        check_cgroups_v1(test_microvm.jailer.cgroups, test_microvm.jailer.jailer_id)
     else:
-        check_cgroups_v2(
-            test_microvm.jailer.cgroups, sys_cgroup, test_microvm.jailer.jailer_id
-        )
+        check_cgroups_v2(test_microvm)
 
 
-def test_cgroups_without_numa(test_microvm_with_initrd, sys_setup_cgroups):
+def test_cgroups_without_numa(uvm_plain, cgroups_info):
     """
     Test the cgroups are correctly set by the jailer, without numa assignment.
-
-    @type: security
     """
-    # pylint: disable=redefined-outer-name
-    test_microvm = test_microvm_with_initrd
-    test_microvm.jailer.cgroup_ver = sys_setup_cgroups
+    test_microvm = uvm_plain
+    test_microvm.jailer.cgroup_ver = cgroups_info.version
     if test_microvm.jailer.cgroup_ver == 2:
         test_microvm.jailer.cgroups = ["cpu.weight=2"]
     else:
@@ -494,57 +389,51 @@ def test_cgroups_without_numa(test_microvm_with_initrd, sys_setup_cgroups):
 
     test_microvm.spawn()
 
-    # We assume sysfs cgroups are mounted here.
-    sys_cgroup = "/sys/fs/cgroup"
-    assert os.path.isdir(sys_cgroup)
-
     if test_microvm.jailer.cgroup_ver == 1:
-        check_cgroups_v1(
-            test_microvm.jailer.cgroups, sys_cgroup, test_microvm.jailer.jailer_id
-        )
+        check_cgroups_v1(test_microvm.jailer.cgroups, test_microvm.jailer.jailer_id)
     else:
-        check_cgroups_v2(
-            test_microvm.jailer.cgroups, sys_cgroup, test_microvm.jailer.jailer_id
-        )
+        check_cgroups_v2(test_microvm)
 
 
-@pytest.mark.skipif(
-    cgroup_v2_available() is True, reason="Requires system with cgroup-v1 enabled."
-)
-@pytest.mark.usefixtures("sys_setup_cgroups")
-def test_v1_default_cgroups(test_microvm_with_initrd):
+def test_v1_default_cgroups(uvm_plain, cgroups_info):
     """
     Test if the jailer is using cgroup-v1 by default.
-
-    @type: security
     """
-    # pylint: disable=redefined-outer-name
-    test_microvm = test_microvm_with_initrd
+    if cgroups_info.version != 1:
+        pytest.skip(reason="Requires system with cgroup-v1 enabled.")
+    test_microvm = uvm_plain
     test_microvm.jailer.cgroups = ["cpu.shares=2"]
-
     test_microvm.spawn()
-
-    # We assume sysfs cgroups are mounted here.
-    sys_cgroup = "/sys/fs/cgroup"
-    assert os.path.isdir(sys_cgroup)
-
-    check_cgroups_v1(
-        test_microvm.jailer.cgroups, sys_cgroup, test_microvm.jailer.jailer_id
-    )
+    check_cgroups_v1(test_microvm.jailer.cgroups, test_microvm.jailer.jailer_id)
 
 
-def test_args_default_resource_limits(test_microvm_with_initrd):
+def test_cgroups_custom_parent_move(uvm_plain, cgroups_info):
+    """
+    Test cgroups when a custom parent cgroup is used and no cgroups are specified
+
+    In this case we just want to move under the parent cgroup
+    """
+    if cgroups_info.version != 2:
+        pytest.skip("cgroupsv2 only")
+    test_microvm = uvm_plain
+    test_microvm.jailer.cgroup_ver = cgroups_info.version
+    # Make it somewhat unique so it doesn't conflict with other test runs
+    parent_cgroup = f"custom_cgroup/{test_microvm.id[:8]}"
+    test_microvm.jailer.parent_cgroup = parent_cgroup
+
+    cgroups_info.new_cgroup(parent_cgroup)
+    test_microvm.spawn()
+    check_cgroups_v2(test_microvm)
+
+
+def test_args_default_resource_limits(uvm_plain):
     """
     Test the default resource limits are correctly set by the jailer.
-
-    @type: security
     """
-    test_microvm = test_microvm_with_initrd
-
+    test_microvm = uvm_plain
     test_microvm.spawn()
-
     # Get firecracker's PID
-    pid = int(test_microvm.jailer_clone_pid)
+    pid = test_microvm.firecracker_pid
     assert pid != 0
 
     # Fetch firecracker process limits for number of open fds
@@ -560,122 +449,114 @@ def test_args_default_resource_limits(test_microvm_with_initrd):
     assert hard == -1
 
 
-def test_args_resource_limits(test_microvm_with_initrd):
+def test_args_resource_limits(uvm_plain):
     """
     Test the resource limits are correctly set by the jailer.
-
-    @type: security
     """
-    test_microvm = test_microvm_with_initrd
+    test_microvm = uvm_plain
     test_microvm.jailer.resource_limits = RESOURCE_LIMITS
-
     test_microvm.spawn()
-
     # Get firecracker's PID
-    pid = int(test_microvm.jailer_clone_pid)
+    pid = test_microvm.firecracker_pid
     assert pid != 0
 
     # Check limit values were correctly set.
     check_limits(pid, NOFILE, FSIZE)
 
 
-def test_negative_file_size_limit(test_microvm_with_api):
+def test_positive_file_size_limit(uvm_plain):
+    """
+    Test creating vm succeeds when memory size is under `fsize` limit.
+    """
+
+    vm_mem_size = 128
+    jail_limit = (vm_mem_size + 1) << 20
+
+    test_microvm = uvm_plain
+    test_microvm.jailer.resource_limits = [f"fsize={jail_limit}"]
+    test_microvm.spawn()
+    test_microvm.basic_config(mem_size_mib=vm_mem_size)
+
+    # Attempt to start a vm.
+    test_microvm.start()
+
+
+def test_negative_file_size_limit(uvm_plain):
     """
     Test creating snapshot file fails when size exceeds `fsize` limit.
-
-    @type: negative
     """
-    test_microvm = test_microvm_with_api
-    test_microvm.jailer.resource_limits = ["fsize=1024"]
-
+    test_microvm = uvm_plain
+    # limit to 1MB, to account for logs and metrics
+    test_microvm.jailer.resource_limits = [f"fsize={2**20}"]
     test_microvm.spawn()
     test_microvm.basic_config()
     test_microvm.start()
 
-    snapshot_builder = SnapshotBuilder(test_microvm)
-    # Create directory and files for saving snapshot state and memory.
-    _snapshot_dir = snapshot_builder.create_snapshot_dir()
-
-    # Pause microVM for snapshot.
-    response = test_microvm.vm.patch(state="Paused")
-    assert test_microvm.api_session.is_status_no_content(response.status_code)
+    test_microvm.pause()
 
     # Attempt to create a snapshot.
     try:
-        test_microvm.snapshot.create(
-            mem_file_path="/snapshot/vm.mem",
-            snapshot_path="/snapshot/vm.vmstate",
+        test_microvm.api.snapshot_create.put(
+            mem_file_path="/vm.mem",
+            snapshot_path="/vm.vmstate",
         )
     except (
         http_client.RemoteDisconnected,
         urllib3.exceptions.ProtocolError,
         requests.exceptions.ConnectionError,
     ) as _error:
-        test_microvm.expect_kill_by_signal = True
         # Check the microVM received signal `SIGXFSZ` (25),
         # which corresponds to exceeding file size limit.
         msg = "Shutting down VM after intercepting signal 25, code 0"
         test_microvm.check_log_message(msg)
         time.sleep(1)
-        # Check that the process was terminated.
-        assert not psutil.pid_exists(test_microvm.jailer_clone_pid)
+
+        test_microvm.mark_killed()
     else:
         assert False, "Negative test failed"
 
 
-def test_negative_no_file_limit(test_microvm_with_api):
+def test_negative_no_file_limit(uvm_plain):
     """
     Test microVM is killed when exceeding `no-file` limit.
-
-    @type: negative
     """
-    test_microvm = test_microvm_with_api
+    test_microvm = uvm_plain
     test_microvm.jailer.resource_limits = ["no-file=3"]
 
     # pylint: disable=W0703
     try:
         test_microvm.spawn()
-    except Exception as error:
+    except ChildProcessError as error:
         assert "No file descriptors available (os error 24)" in str(error)
-        assert test_microvm.jailer_clone_pid is None
+
+        test_microvm.mark_killed()
     else:
         assert False, "Negative test failed"
 
 
-def test_new_pid_ns_resource_limits(test_microvm_with_api):
+def test_new_pid_ns_resource_limits(uvm_plain):
     """
     Test that Firecracker process inherits jailer resource limits.
-
-    @type: security
     """
-    test_microvm = test_microvm_with_api
-
-    test_microvm.jailer.new_pid_ns = True
+    test_microvm = uvm_plain
     test_microvm.jailer.resource_limits = RESOURCE_LIMITS
-
     test_microvm.spawn()
 
     # Get Firecracker's PID.
-    fc_pid = test_microvm.pid_in_new_ns
+    fc_pid = test_microvm.firecracker_pid
+
     # Check limit values were correctly set.
     check_limits(fc_pid, NOFILE, FSIZE)
 
 
-def test_new_pid_namespace(test_microvm_with_api):
+def test_new_pid_namespace(uvm_plain):
     """
     Test that Firecracker is spawned in a new PID namespace if requested.
-
-    @type: security
     """
-    test_microvm = test_microvm_with_api
-
-    test_microvm.jailer.new_pid_ns = True
-
+    test_microvm = uvm_plain
     test_microvm.spawn()
-
     # Check that the PID file exists.
-    fc_pid = test_microvm.pid_in_new_ns
-    assert fc_pid is not None
+    fc_pid = test_microvm.firecracker_pid
 
     # Validate the PID.
     stdout = subprocess.check_output("pidof firecracker", shell=True)
@@ -697,3 +578,89 @@ def test_new_pid_namespace(test_microvm_with_api):
     assert len(nstgid_list) == 2
     assert int(nstgid_list[1]) == 1
     assert int(nstgid_list[0]) == fc_pid
+
+
+@pytest.mark.parametrize(
+    "daemonize",
+    [True, False],
+)
+@pytest.mark.parametrize(
+    "new_pid_ns",
+    [True, False],
+)
+def test_firecracker_kill_by_pid(uvm_plain, daemonize, new_pid_ns):
+    """
+    Test that Firecracker is spawned in a new PID namespace if requested.
+    """
+    microvm = uvm_plain
+    microvm.jailer.daemonize = daemonize
+    microvm.jailer.new_pid_ns = new_pid_ns
+    microvm.spawn()
+    microvm.basic_config()
+    microvm.add_net_iface()
+    microvm.start()
+
+    # before killing microvm make sure the Jailer config is what we set it to be.
+    assert (
+        microvm.jailer.daemonize == daemonize
+        and microvm.jailer.new_pid_ns == new_pid_ns
+    )
+    microvm.kill()
+
+
+def test_cgroupsv2_written_only_once(uvm_plain, cgroups_info):
+    """
+    Test that we only write to cgroup.procs once when using CgroupsV2
+
+    Assert that the jailer doesn't perform unneccessary create_dir_all
+    and attach_pid calls. This is a regression test for #2856
+    """
+    if cgroups_info.version != 2:
+        pytest.skip(reason="Requires system with cgroup-v2 enabled.")
+
+    uvm = uvm_plain
+    strace_output_path = Path(uvm.path, "strace.out")
+    strace_cmd = [
+        "strace",
+        "-tt",
+        "--syscall-times=ns",
+        "-y",
+        "-e",
+        "write,mkdir,mkdirat",
+        "-o",
+        strace_output_path,
+    ]
+    uvm.add_pre_cmd(strace_cmd)
+
+    parent_cgroup = "custom_cgroup/group2"
+    uvm.jailer.cgroup_ver = cgroups_info.version
+    uvm.jailer.parent_cgroup = parent_cgroup
+    # create the parent so that mkdirs doesn't need to
+    cgroups_info.new_cgroup(parent_cgroup)
+
+    cgroups = {
+        "cpuset.cpus": get_cpus(0),
+        "cpu.weight": 2,
+        "memory.max": 256 * 2**20,
+        "memory.min": 1 * 2**20,
+    }
+    uvm.jailer.cgroups = [f"{k}={v}" for k, v in cgroups.items()]
+    uvm.spawn()
+    uvm.basic_config()
+    uvm.add_net_iface()
+    uvm.start()
+    strace_out = strace_output_path.read_text(encoding="utf-8").splitlines()
+    write_lines = [
+        line
+        for line in strace_out
+        if "write" in line and f"{uvm.id}/cgroup.procs" in line
+    ]
+    mkdir_lines = [
+        line
+        for line in strace_out
+        if "mkdir" in line and f"{parent_cgroup}/{uvm.id}" in line
+    ]
+    assert len(write_lines) != len(cgroups), "writes equal to number of cgroups"
+    assert len(write_lines) == 1
+    assert len(mkdir_lines) != len(cgroups), "mkdir equal to number of cgroups"
+    assert len(mkdir_lines) == 1

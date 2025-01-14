@@ -4,9 +4,10 @@
 use libc::{
     c_int, c_void, siginfo_t, SIGBUS, SIGHUP, SIGILL, SIGPIPE, SIGSEGV, SIGSYS, SIGXCPU, SIGXFSZ,
 };
-use logger::{error, IncMetric, StoreMetric, METRICS};
-use utils::signal::register_signal_handler;
+use log::error;
 
+use crate::logger::{IncMetric, StoreMetric, METRICS};
+use crate::utils::signal::register_signal_handler;
 use crate::FcExitCode;
 
 // The offset of `si_syscall` (offending syscall identifier) within the siginfo structure
@@ -67,7 +68,6 @@ fn log_sigsys_err(si_code: c_int, info: *mut siginfo_t) {
     // SAFETY: Other signals which might do async unsafe things incompatible with the rest of this
     // function are blocked due to the sa_mask used when registering the signal handler.
     let syscall = unsafe { *(info as *const i32).offset(SI_OFF_SYSCALL) };
-    let syscall = usize::try_from(syscall).unwrap();
     error!(
         "Shutting down VM after intercepting a bad syscall ({}).",
         syscall
@@ -155,7 +155,7 @@ extern "C" fn sigpipe_handler(num: c_int, info: *mut siginfo_t, _unused: *mut c_
 ///
 /// Custom handlers are installed for: `SIGBUS`, `SIGSEGV`, `SIGSYS`
 /// `SIGXFSZ` `SIGXCPU` `SIGPIPE` `SIGHUP` and `SIGILL`.
-pub fn register_signal_handlers() -> utils::errno::Result<()> {
+pub fn register_signal_handlers() -> vmm_sys_util::errno::Result<()> {
     // Call to unsafe register_signal_handler which is considered unsafe because it will
     // register a signal handler which will be called in the current thread and will interrupt
     // whatever work is done on the current thread, so we have to keep in mind that the registered
@@ -184,11 +184,11 @@ mod tests {
     #[test]
     fn test_signal_handler() {
         let child = thread::spawn(move || {
-            assert!(register_signal_handlers().is_ok());
+            register_signal_handlers().unwrap();
 
             let filter = make_test_seccomp_bpf_filter();
 
-            assert!(seccompiler::apply_filter(&filter).is_ok());
+            seccompiler::apply_filter(&filter).unwrap();
             assert_eq!(METRICS.seccomp.num_faults.fetch(), 0);
 
             // Call the forbidden `SYS_mkdirat`.
@@ -236,7 +236,7 @@ mod tests {
                 syscall(libc::SYS_kill, process::id(), SIGILL);
             }
         });
-        assert!(child.join().is_ok());
+        child.join().unwrap();
 
         assert!(METRICS.seccomp.num_faults.fetch() >= 1);
         assert!(METRICS.signals.sigbus.fetch() >= 1);

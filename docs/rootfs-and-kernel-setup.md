@@ -4,8 +4,8 @@
 
 ### Manual compilation
 
-Currently, Firecracker supports uncompressed ELF kernel images on x86_64 while on
-aarch64 it supports PE formatted images.
+Currently, Firecracker supports uncompressed ELF kernel images on x86_64 while
+on aarch64 it supports PE formatted images.
 
 Here's a quick step-by-step guide to building your own kernel that Firecracker
 can boot:
@@ -25,9 +25,9 @@ can boot:
    ```
 
 1. You will need to configure your Linux build. You can start from our
-   recommended  [guest kernel configurations](../resources/guest_configs/)
-   by copying the relevant one to `.config` (under the Linux sources dir).
-   You can make interactive config adjustments using:
+   recommended [guest kernel configurations](../resources/guest_configs/) by
+   copying the relevant one to `.config` (under the Linux sources dir). You can
+   make interactive config adjustments using:
 
    ```bash
    make menuconfig
@@ -47,8 +47,8 @@ can boot:
    fi
    ```
 
-1. Upon a successful build, you can find the kernel image under `./vmlinux`
-   (for x86) or `./arch/arm64/boot/Image` (for aarch64).
+1. Upon a successful build, you can find the kernel image under `./vmlinux` (for
+   x86) or `./arch/arm64/boot/Image` (for aarch64).
 
 For a list of currently supported kernel versions, check out the
 [kernel support policy](kernel-policy.md).
@@ -56,37 +56,43 @@ For a list of currently supported kernel versions, check out the
 ### Use the provided recipe
 
 The kernel images used in our CI to test Firecracker's features are obtained by
-using the recipe inside devtool:
+running the script `resources/rebuild.sh`.
+
+Users can build those locally by running:
 
 ```bash
-config="resources/guest_configs/microvm-kernel-x86_64-4.14.config"
-./tools/devtool build_kernel -c $config -n 8
+./tools/devtool build_ci_artifacts kernels
 ```
 
-or
+This will build all versions that we currently use in our CI. `kernels`
+subcommand allows passing a specific kernel version to build. For example:
 
 ```bash
-config="resources/guest_configs/microvm-kernel-arm64-4.14.config"
-./tools/devtool build_kernel -c $config -n 8
+./tools/devtool build_ci_artifacts kernels 6.1
 ```
 
-on an aarch64 machine.
+will build only the 6.1 kernel.
+
+Currently supported kernel versions are: `5.10`, `5.10-no-acpi` (same as 5.10
+but without ACPI support) and `6.1`.
+
+After the command finishes, the kernels along with the corresponding KConfig
+used will be stored under `resources/$(uname -m)`.
 
 ## Creating a rootfs Image
 
-A rootfs image is just a file system image, that hosts at least an init
-system. For instance, our getting started guide uses an EXT4 FS image with
-OpenRC as an init system. Note that, whichever file system you choose to use,
-support for it will have to be compiled into the kernel, so it can be mounted
-at boot time.
+A rootfs image is just a file system image, that hosts at least an init system.
+For instance, our getting started guide uses an ext4 filesystem image. Note
+that, whichever file system you choose to use, support for it will have to be
+compiled into the kernel, so it can be mounted at boot time.
 
-In order to obtain an EXT4 image that you can use with Firecracker, you have
-the following options:
+In order to obtain an ext4 image that you can use with Firecracker, you have the
+following options:
 
 ### Manual build
 
-1. Prepare a properly-sized file. We'll use 50MiB here, but this depends
-   on how much data you'll want to fit inside:
+1. Prepare a properly-sized file. We'll use 50MiB here, but this depends on how
+   much data you'll want to fit inside:
 
    ```bash
    dd if=/dev/zero of=rootfs.ext4 bs=1M count=50
@@ -98,27 +104,27 @@ the following options:
    mkfs.ext4 rootfs.ext4
    ```
 
-You now have an empty EXT4 image in `rootfs.ext4`, so let's prepare to
-populate it. First, you'll need to mount this new file system, so you
-can easily access its contents:
+You now have an empty EXT4 image in `rootfs.ext4`, so let's prepare to populate
+it. First, you'll need to mount this new file system, so you can easily access
+its contents:
 
 ```bash
 mkdir /tmp/my-rootfs
 sudo mount rootfs.ext4 /tmp/my-rootfs
 ```
 
-The minimal init system would be just an ELF binary, placed at `/sbin/init`.
-The final step in the Linux boot process executes `/sbin/init` and expects it
-to never exit. More complex init systems build on top of this, providing
-service configuration files, startup / shutdown scripts for various services,
-and many other features.
+The minimal init system would be just an ELF binary, placed at `/sbin/init`. The
+final step in the Linux boot process executes `/sbin/init` and expects it to
+never exit. More complex init systems build on top of this, providing service
+configuration files, startup / shutdown scripts for various services, and many
+other features.
 
-For the sake of simplicity, let's set up an Alpine-based rootfs, with OpenRC
-as an init system. To that end, we'll use the official Docker image for
-Alpine Linux:
+For the sake of simplicity, let's set up an Alpine-based rootfs, with OpenRC as
+an init system. To that end, we'll use the official Docker image for Alpine
+Linux:
 
-1. First, let's start the Alpine container, bind-mounting the EXT4 image
-   created earlier, to `/my-rootfs`:
+1. First, let's start the Alpine container, bind-mounting the EXT4 image created
+   earlier, to `/my-rootfs`:
 
    ```bash
    docker run -it --rm -v /tmp/my-rootfs:/my-rootfs alpine
@@ -168,20 +174,14 @@ Alpine Linux:
 ### Use the provided recipe
 
 The disk images used in our CI to test Firecracker's features are obtained by
-using the recipe inside devtool:
+using the recipe (in a Ubuntu 22.04 host):
 
 ```bash
-./tools/devtool build_rootfs -s 300MB
+./tools/devtool build_ci_artifacts rootfs
 ```
 
-or
+The images resulting using this method are minimized Ubuntu 22.04. Feel free to
+adjust the script(s) to suit your use case.
 
-```bash
-./tools/devtool build_rootfs -p
-```
-
-in order to obtain a partuuid enabled rootfs.
-The images resulting using this method are minimized Ubuntu 18.04.
-
-You should now have a kernel image (`vmlinux`) and a rootfs image
-(`rootfs.ext4`), that you can boot with Firecracker.
+You should now have a rootfs image (`ubuntu-22.04.ext4`), that you can boot with
+Firecracker.

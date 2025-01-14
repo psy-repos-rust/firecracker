@@ -2,13 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Auxiliary module for configuring the metrics system.
-use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 
-use logger::METRICS;
 use serde::{Deserialize, Serialize};
 
-use super::{open_file_nonblock, FcLineWriter};
+use super::open_file_nonblock;
+use crate::logger::{FcLineWriter, METRICS};
 
 /// Strongly typed structure used to describe the metrics system.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -18,35 +17,26 @@ pub struct MetricsConfig {
 }
 
 /// Errors associated with actions on the `MetricsConfig`.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum MetricsConfigError {
-    /// Cannot initialize the metrics system due to bad user input.
+    /// Cannot initialize the metrics system due to bad user input: {0}
     InitializationFailure(String),
 }
 
-impl Display for MetricsConfigError {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        use self::MetricsConfigError::*;
-        match *self {
-            InitializationFailure(ref err_msg) => write!(f, "{}", err_msg.replace('\"', "")),
-        }
-    }
-}
-
 /// Configures the metrics as described in `metrics_cfg`.
-pub fn init_metrics(metrics_cfg: MetricsConfig) -> std::result::Result<(), MetricsConfigError> {
+pub fn init_metrics(metrics_cfg: MetricsConfig) -> Result<(), MetricsConfigError> {
     let writer = FcLineWriter::new(
         open_file_nonblock(&metrics_cfg.metrics_path)
             .map_err(|err| MetricsConfigError::InitializationFailure(err.to_string()))?,
     );
     METRICS
-        .init(Box::new(writer))
+        .init(writer)
         .map_err(|err| MetricsConfigError::InitializationFailure(err.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
-    use utils::tempfile::TempFile;
+    use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
 
@@ -56,7 +46,7 @@ mod tests {
         let desc = MetricsConfig {
             metrics_path: PathBuf::from("not_found_file_metrics"),
         };
-        assert!(init_metrics(desc).is_err());
+        init_metrics(desc).unwrap_err();
 
         // Initializing metrics with valid pipe is ok.
         let metrics_file = TempFile::new().unwrap();
@@ -64,20 +54,7 @@ mod tests {
             metrics_path: metrics_file.as_path().to_path_buf(),
         };
 
-        assert!(init_metrics(desc.clone()).is_ok());
-        assert!(init_metrics(desc).is_err());
-    }
-
-    #[test]
-    fn test_error_display() {
-        assert_eq!(
-            format!(
-                "{}",
-                MetricsConfigError::InitializationFailure(String::from(
-                    "Failed to initialize metrics"
-                ))
-            ),
-            "Failed to initialize metrics"
-        );
+        init_metrics(desc.clone()).unwrap();
+        init_metrics(desc).unwrap_err();
     }
 }

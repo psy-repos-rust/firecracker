@@ -3,6 +3,7 @@
 """Utilities for creating filesystems on the host."""
 
 import os
+import tempfile
 
 from framework import utils
 
@@ -13,12 +14,20 @@ class FilesystemFile:
     KNOWN_FILEFS_FORMATS = {"ext4"}
     path = None
 
-    def __init__(self, path: str, size: int = 256, fs_format: str = "ext4"):
+    def __init__(self, path: str = None, size: int = 256, fs_format: str = "ext4"):
         """Create a new file system in a file.
 
         Raises if the file system format is not supported, if the file already
         exists, or if it ends in '/'.
         """
+
+        # If no path is supplied, use a temporary file.
+        # This is useful to force placing the file on disk, not in memory,
+        # because qemu vhost-user-blk backend always uses O_DIRECT,
+        # but O_DIRECT is not supported by tmpfs.
+        if path is None:
+            _, path = tempfile.mkstemp(suffix=f".{fs_format}", dir="/tmp")
+
         if fs_format not in self.KNOWN_FILEFS_FORMATS:
             raise ValueError("Format not in: + " + str(self.KNOWN_FILEFS_FORMATS))
         # Here we append the format as a
@@ -27,11 +36,11 @@ class FilesystemFile:
         if os.path.isfile(path):
             raise FileExistsError("File already exists: " + path)
 
-        utils.run_cmd(
+        utils.check_output(
             "dd status=none if=/dev/zero"
             "    of=" + path + "    bs=1M count=" + str(size)
         )
-        utils.run_cmd("mkfs.ext4 -qF " + path)
+        utils.check_output("mkfs.ext4 -qF " + path)
         self.path = path
 
     def __repr__(self):
@@ -39,8 +48,8 @@ class FilesystemFile:
 
     def resize(self, new_size):
         """Resize the filesystem."""
-        utils.run_cmd("truncate --size " + str(new_size) + "M " + self.path)
-        utils.run_cmd("resize2fs " + self.path)
+        utils.check_output("truncate --size " + str(new_size) + "M " + self.path)
+        utils.check_output("resize2fs " + self.path)
 
     def size(self):
         """Return the size of the filesystem."""

@@ -32,37 +32,37 @@
 //!     collection of `BpfProgram` objects
 //! ```
 
+use std::collections::BTreeMap;
+use std::convert::TryInto;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::PathBuf;
+
 mod backend;
 mod common;
 mod compiler;
 mod syscall_table;
 
-use std::collections::BTreeMap;
-use std::convert::TryInto;
-use std::fs::File;
-use std::io::{BufReader, Read};
-use std::path::PathBuf;
-use std::{io, process};
-
 use backend::{TargetArch, TargetArchError};
 use bincode::Error as BincodeError;
 use common::BpfProgram;
-use compiler::{Compiler, Error as FilterFormatError, JsonFile};
+use compiler::{CompilationError, Compiler, JsonFile};
 use serde_json::error::Error as JSONError;
-use utils::arg_parser::{ArgParser, Argument, Arguments as ArgumentsBag};
+use utils::arg_parser::{
+    ArgParser, Argument, Arguments as ArgumentsBag, UtilsArgParserError as ArgParserError,
+};
 
-const SECCOMPILER_VERSION: &str = env!("FIRECRACKER_VERSION");
+const SECCOMPILER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_OUTPUT_FILENAME: &str = "seccomp_binary_filter.out";
-const EXIT_CODE_ERROR: i32 = 1;
 
 #[derive(Debug, thiserror::Error)]
-enum Error {
+enum SeccompError {
     #[error("Bincode (de)serialization failed: {0}")]
     Bincode(BincodeError),
     #[error("{0}")]
-    FileFormat(FilterFormatError),
+    Compilation(CompilationError),
     #[error("{}", format!("Failed to open file {:?}: {1}", .0, .1).replace('\"', ""))]
-    FileOpen(PathBuf, io::Error),
+    FileOpen(PathBuf, std::io::Error),
     #[error("Error parsing JSON: {0}")]
     Json(JSONError),
     #[error("Missing input file.")]
@@ -72,8 +72,6 @@ enum Error {
     #[error("{0}")]
     Arch(#[from] TargetArchError),
 }
-
-type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, PartialEq)]
 struct Arguments {
@@ -113,17 +111,15 @@ fn build_arg_parser() -> ArgParser<'static> {
         ))
 }
 
-fn get_argument_values(arguments: &ArgumentsBag) -> Result<Arguments> {
-    let arch_string = arguments.single_value("target-arch");
-    if arch_string.is_none() {
-        return Err(Error::MissingTargetArch);
-    }
-    let target_arch: TargetArch = arch_string.unwrap().as_str().try_into()?;
+fn get_argument_values(arguments: &ArgumentsBag) -> Result<Arguments, SeccompError> {
+    let Some(arch_string) = arguments.single_value("target-arch") else {
+        return Err(SeccompError::MissingTargetArch);
+    };
+    let target_arch: TargetArch = arch_string.as_str().try_into()?;
 
-    let input_file = arguments.single_value("input-file");
-    if input_file.is_none() {
-        return Err(Error::MissingInputFile);
-    }
+    let Some(input_file) = arguments.single_value("input-file") else {
+        return Err(SeccompError::MissingInputFile);
+    };
 
     let is_basic = arguments.flag_present("basic");
     if is_basic {
@@ -135,90 +131,97 @@ fn get_argument_values(arguments: &ArgumentsBag) -> Result<Arguments> {
 
     Ok(Arguments {
         target_arch,
-        input_file: input_file.unwrap().to_owned(),
+        input_file: input_file.to_owned(),
         // Safe to unwrap because it has a default value
         output_file: arguments.single_value("output-file").unwrap().to_owned(),
         is_basic,
     })
 }
 
-fn parse_json(reader: impl Read) -> Result<JsonFile> {
-    serde_json::from_reader(reader).map_err(Error::Json)
-}
-
-fn compile(args: &Arguments) -> Result<()> {
+fn compile(args: &Arguments) -> Result<(), SeccompError> {
     let input_file = File::open(&args.input_file)
-        .map_err(|err| Error::FileOpen(PathBuf::from(&args.input_file), err))?;
+        .map_err(|err| SeccompError::FileOpen(PathBuf::from(&args.input_file), err))?;
     let mut input_reader = BufReader::new(input_file);
-    let filters = parse_json(&mut input_reader)?;
+    let filters =
+        serde_json::from_reader::<_, JsonFile>(&mut input_reader).map_err(SeccompError::Json)?;
     let compiler = Compiler::new(args.target_arch);
 
     // transform the IR into a Map of BPFPrograms
     let bpf_data: BTreeMap<String, BpfProgram> = compiler
         .compile_blob(filters.0, args.is_basic)
-        .map_err(Error::FileFormat)?;
+        .map_err(SeccompError::Compilation)?;
 
     // serialize the BPF programs & output them to a file
     let output_file = File::create(&args.output_file)
-        .map_err(|err| Error::FileOpen(PathBuf::from(&args.output_file), err))?;
-    bincode::serialize_into(output_file, &bpf_data).map_err(Error::Bincode)?;
+        .map_err(|err| SeccompError::FileOpen(PathBuf::from(&args.output_file), err))?;
+    bincode::serialize_into(output_file, &bpf_data).map_err(SeccompError::Bincode)?;
 
     Ok(())
 }
 
-fn main() {
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+enum SeccompilerError {
+    /// Argument Parsing Error: {0}
+    ArgParsing(ArgParserError),
+    /// {0} \n\nFor more information try --help.
+    InvalidArgumentValue(SeccompError),
+    /// {0}
+    Error(SeccompError),
+}
+
+fn main() -> core::result::Result<(), SeccompilerError> {
+    let result = main_exec();
+    if let Err(e) = result {
+        eprintln!("{}", e);
+        Err(e)
+    } else {
+        Ok(())
+    }
+}
+
+fn main_exec() -> core::result::Result<(), SeccompilerError> {
     let mut arg_parser = build_arg_parser();
 
-    if let Err(err) = arg_parser.parse_from_cmdline() {
-        eprintln!(
-            "Arguments parsing error: {} \n\nFor more information try --help.",
-            err
-        );
-        process::exit(EXIT_CODE_ERROR);
-    }
+    arg_parser
+        .parse_from_cmdline()
+        .map_err(SeccompilerError::ArgParsing)?;
 
     if arg_parser.arguments().flag_present("help") {
         println!("Seccompiler-bin v{}\n", SECCOMPILER_VERSION);
         println!("{}", arg_parser.formatted_help());
-        return;
+        return Ok(());
     }
     if arg_parser.arguments().flag_present("version") {
         println!("Seccompiler-bin v{}\n", SECCOMPILER_VERSION);
-        return;
+        return Ok(());
     }
 
-    let args = get_argument_values(arg_parser.arguments()).unwrap_or_else(|err| {
-        eprintln!("{} \n\nFor more information try --help.", err);
-        process::exit(EXIT_CODE_ERROR);
-    });
+    let args = get_argument_values(arg_parser.arguments())
+        .map_err(SeccompilerError::InvalidArgumentValue)?;
 
-    if let Err(err) = compile(&args) {
-        eprintln!("Seccompiler error: {}", err);
-        process::exit(EXIT_CODE_ERROR);
-    }
+    compile(&args).map_err(SeccompilerError::Error)?;
 
     println!("Filter successfully compiled into: {}", args.output_file);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
-    use std::collections::HashMap;
+
     use std::io;
     use std::io::Write;
     use std::path::PathBuf;
 
     use bincode::Error as BincodeError;
-    use utils::tempfile::TempFile;
+    use vmm_sys_util::tempfile::TempFile;
 
-    use super::compiler::{Error as FilterFormatError, Filter, SyscallRule};
+    use super::compiler::CompilationError as FilterFormatError;
     use super::{
-        build_arg_parser, compile, get_argument_values, parse_json, Arguments, Error,
+        build_arg_parser, compile, get_argument_values, Arguments, SeccompError,
         DEFAULT_OUTPUT_FILENAME,
     };
-    use crate::backend::SeccompCmpArgLen::*;
-    use crate::backend::SeccompCmpOp::{Le, *};
-    use crate::backend::{SeccompAction, SeccompCondition as Cond, TargetArch, TargetArchError};
+    use crate::backend::{TargetArch, TargetArchError};
 
     // Correct JSON input data
     static CORRECT_JSON_INPUT: &str = r#"
@@ -324,7 +327,7 @@ mod tests {
         assert_eq!(
             format!(
                 "{}",
-                Error::Bincode(BincodeError::new(bincode::ErrorKind::SizeLimit))
+                SeccompError::Bincode(BincodeError::new(bincode::ErrorKind::SizeLimit))
             ),
             format!(
                 "Bincode (de)serialization failed: {}",
@@ -334,7 +337,7 @@ mod tests {
         assert_eq!(
             format!(
                 "{}",
-                Error::FileFormat(FilterFormatError::SyscallName(
+                SeccompError::Compilation(FilterFormatError::SyscallName(
                     "dsaa".to_string(),
                     TargetArch::aarch64
                 ))
@@ -347,7 +350,7 @@ mod tests {
         assert_eq!(
             format!(
                 "{}",
-                Error::FileOpen(path.clone(), io::Error::from_raw_os_error(2))
+                SeccompError::FileOpen(path.clone(), io::Error::from_raw_os_error(2))
             ),
             format!(
                 "Failed to open file {:?}: {}",
@@ -359,7 +362,7 @@ mod tests {
         assert_eq!(
             format!(
                 "{}",
-                Error::Json(serde_json::from_str::<serde_json::Value>("").unwrap_err())
+                SeccompError::Json(serde_json::from_str::<serde_json::Value>("").unwrap_err())
             ),
             format!(
                 "Error parsing JSON: {}",
@@ -367,17 +370,17 @@ mod tests {
             )
         );
         assert_eq!(
-            format!("{}", Error::MissingInputFile),
+            format!("{}", SeccompError::MissingInputFile),
             "Missing input file."
         );
         assert_eq!(
-            format!("{}", Error::MissingTargetArch),
+            format!("{}", SeccompError::MissingTargetArch),
             "Missing target arch."
         );
         assert_eq!(
             format!(
                 "{}",
-                Error::Arch(TargetArchError::InvalidString("lala".to_string()))
+                SeccompError::Arch(TargetArchError::InvalidString("lala".to_string()))
             ),
             format!("{}", TargetArchError::InvalidString("lala".to_string()))
         );
@@ -497,7 +500,7 @@ mod tests {
                 .as_ref(),
             )
             .unwrap();
-        assert!(get_argument_values(arguments).is_err());
+        get_argument_values(arguments).unwrap_err();
 
         // invalid value supplied to --basic
         let arguments = &mut arg_parser.arguments().clone();
@@ -520,213 +523,6 @@ mod tests {
             .is_err());
     }
 
-    #[test]
-    fn test_parse_json() {
-        // test with malformed JSON
-        {
-            // empty file
-            assert!(parse_json(std::io::empty()).is_err());
-
-            // not json
-            let json_input = "hjkln";
-            assert!(parse_json(json_input.as_bytes()).is_err());
-
-            // top-level array
-            let json_input = "[]";
-            assert!(parse_json(json_input.as_bytes()).is_err());
-
-            // thread key must be a string
-            let json_input = "{1}";
-            assert!(parse_json(json_input.as_bytes()).is_err());
-
-            // empty Filter object
-            let json_input = r#"{"a": {}}"#;
-            assert!(parse_json(json_input.as_bytes()).is_err());
-
-            // missing 'filter' field
-            let json_input = r#"{"a": {"filter_action": "allow", "default_action":"log"}}"#;
-            assert!(parse_json(json_input.as_bytes()).is_err());
-
-            // wrong key 'filters'
-            let json_input =
-                r#"{"a": {"filter_action": "allow", "default_action":"log", "filters": []}}"#;
-            assert!(parse_json(json_input.as_bytes()).is_err());
-
-            // wrong action 'logs'
-            let json_input =
-                r#"{"a": {"filter_action": "allow", "default_action":"logs", "filter": []}}"#;
-            assert!(parse_json(json_input.as_bytes()).is_err());
-
-            // action that expects a value
-            let json_input =
-                r#"{"a": {"filter_action": "allow", "default_action":"errno", "filter": []}}"#;
-
-            assert!(parse_json(json_input.as_bytes()).is_err());
-
-            // overflowing u64 value
-            let json_input = r#"
-            {
-                "thread_2": {
-                    "default_action": "trap",
-                    "filter_action": "allow",
-                    "filter": [
-                        {
-                            "syscall": "ioctl",
-                            "args": [
-                                {
-                                    "index": 3,
-                                    "type": "qword",
-                                    "op": "eq",
-                                    "val": 18446744073709551616
-                                }
-                            ]
-                        }
-                    ]
-                }
-            }
-            "#;
-            assert!(parse_json(json_input.as_bytes()).is_err());
-
-            // negative integer value
-            let json_input = r#"
-            {
-                "thread_2": {
-                    "default_action": "trap",
-                    "filter_action": "allow",
-                    "filter": [
-                        {
-                            "syscall": "ioctl",
-                            "args": [
-                                {
-                                    "index": 3,
-                                    "type": "qword",
-                                    "op": "eq",
-                                    "val": -1846
-                                }
-                            ]
-                        }
-                    ]
-                }
-            }
-            "#;
-            assert!(parse_json(json_input.as_bytes()).is_err());
-
-            // float value
-            let json_input = r#"
-            {
-                "thread_2": {
-                    "default_action": "trap",
-                    "filter_action": "allow",
-                    "filter": [
-                        {
-                            "syscall": "ioctl",
-                            "args": [
-                                {
-                                    "index": 3,
-                                    "type": "qword",
-                                    "op": "eq",
-                                    "val": 1846.4
-                                }
-                            ]
-                        }
-                    ]
-                }
-            }
-            "#;
-            assert!(parse_json(json_input.as_bytes()).is_err());
-
-            // duplicate filter keys
-            let json_input = r#"
-            {
-                "thread_1": {
-                    "default_action": "trap",
-                    "filter_action": "allow",
-                    "filter": []
-                },
-                "thread_1": {
-                    "default_action": "trap",
-                    "filter_action": "allow",
-                    "filter": []
-                }
-            }
-            "#;
-            assert!(parse_json(json_input.as_bytes()).is_err());
-        }
-
-        // test with correctly formed JSON
-        {
-            // empty JSON file
-            let json_input = "{}";
-            assert_eq!(parse_json(json_input.as_bytes()).unwrap().0.len(), 0);
-
-            // empty Filter
-            let json_input =
-                r#"{"a": {"filter_action": "allow", "default_action":"log", "filter": []}}"#;
-            assert!(parse_json(json_input.as_bytes()).is_ok());
-
-            // correctly formed JSON filter
-            let mut filters = HashMap::new();
-            filters.insert(
-                "thread_1".to_string(),
-                Filter::new(
-                    SeccompAction::Errno(12),
-                    SeccompAction::Allow,
-                    vec![
-                        SyscallRule::new("open".to_string(), None),
-                        SyscallRule::new("close".to_string(), None),
-                        SyscallRule::new("stat".to_string(), None),
-                        SyscallRule::new(
-                            "futex".to_string(),
-                            Some(vec![
-                                Cond::new(2, Dword, Le, 65).unwrap(),
-                                Cond::new(1, Qword, Ne, 80).unwrap(),
-                            ]),
-                        ),
-                        SyscallRule::new(
-                            "futex".to_string(),
-                            Some(vec![
-                                Cond::new(3, Qword, Gt, 65).unwrap(),
-                                Cond::new(1, Qword, Lt, 80).unwrap(),
-                            ]),
-                        ),
-                        SyscallRule::new(
-                            "futex".to_string(),
-                            Some(vec![Cond::new(3, Qword, Ge, 65).unwrap()]),
-                        ),
-                        SyscallRule::new(
-                            "ioctl".to_string(),
-                            Some(vec![Cond::new(3, Dword, MaskedEq(100), 65).unwrap()]),
-                        ),
-                    ],
-                ),
-            );
-
-            filters.insert(
-                "thread_2".to_string(),
-                Filter::new(
-                    SeccompAction::Trap,
-                    SeccompAction::Allow,
-                    vec![SyscallRule::new(
-                        "ioctl".to_string(),
-                        Some(vec![Cond::new(3, Dword, Eq, 65).unwrap()]),
-                    )],
-                ),
-            );
-
-            // sort the HashMaps by key and transform into vectors, to make comparison possible
-            let mut v1: Vec<_> = filters.into_iter().collect();
-            v1.sort_by(|x, y| x.0.cmp(&y.0));
-
-            let mut v2: Vec<_> = parse_json(CORRECT_JSON_INPUT.as_bytes())
-                .unwrap()
-                .0
-                .into_iter()
-                .collect();
-            v2.sort_by(|x, y| x.0.cmp(&y.0));
-            assert_eq!(v1, v2);
-        }
-    }
-
     #[allow(clippy::useless_asref)]
     #[test]
     fn test_compile() {
@@ -742,7 +538,7 @@ mod tests {
             };
 
             match compile(&args).unwrap_err() {
-                Error::FileOpen(buf, _) => assert_eq!(buf, PathBuf::from(in_file.as_path())),
+                SeccompError::FileOpen(buf, _) => assert_eq!(buf, PathBuf::from(in_file.as_path())),
                 _ => panic!("Expected FileOpen error."),
             }
         }
@@ -765,7 +561,7 @@ mod tests {
             };
 
             // do the compilation & check for errors
-            assert!(compile(&arguments).is_ok());
+            compile(&arguments).unwrap();
 
             // also check with is_basic: true
             let arguments = Arguments {
@@ -776,7 +572,7 @@ mod tests {
             };
 
             // do the compilation & check for errors
-            assert!(compile(&arguments).is_ok());
+            compile(&arguments).unwrap();
         }
     }
 }

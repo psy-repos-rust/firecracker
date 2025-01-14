@@ -2,76 +2,64 @@
 # SPDX-License-Identifier: Apache-2.0
 """Test that the process startup time up to socket bind is within spec."""
 
-import json
 import os
-import platform
 import time
 
-import host_tools.logging as log_tools
 from host_tools.cargo_build import run_seccompiler_bin
 
-MAX_STARTUP_TIME_CPU_US = {"x86_64": 5500, "aarch64": 3800}
-""" The maximum acceptable startup time in CPU us. """
-# TODO: Keep a `current` startup time in S3 and validate we don't regress
 
-
-def test_startup_time_new_pid_ns(test_microvm_with_api, record_property):
+def test_startup_time_new_pid_ns(
+    microvm_factory, guest_kernel_linux_5_10, rootfs, metrics
+):
     """
     Check startup time when jailer is spawned in a new PID namespace.
-
-    @type: performance
     """
-    microvm = test_microvm_with_api
-    microvm.bin_cloner_path = None
-    microvm.jailer.new_pid_ns = True
-    record_property("startup_time_new_pid_μs", _test_startup_time(microvm))
+    for _ in range(10):
+        microvm = microvm_factory.build(guest_kernel_linux_5_10, rootfs)
+        microvm.jailer.new_pid_ns = True
+        _test_startup_time(microvm, metrics, "new_pid_ns")
 
 
-def test_startup_time_daemonize(test_microvm_with_api, record_property):
+def test_startup_time_daemonize(
+    microvm_factory, guest_kernel_linux_5_10, rootfs, metrics
+):
     """
     Check startup time when jailer detaches Firecracker from the controlling terminal.
-
-    @type: performance
     """
-    microvm = test_microvm_with_api
-    record_property("startup_time_daemonize_μs", _test_startup_time(microvm))
+    for _ in range(10):
+        microvm = microvm_factory.build(guest_kernel_linux_5_10, rootfs)
+        _test_startup_time(microvm, metrics, "daemonize")
 
 
-def test_startup_time_custom_seccomp(test_microvm_with_api, record_property):
+def test_startup_time_custom_seccomp(
+    microvm_factory, guest_kernel_linux_5_10, rootfs, metrics
+):
     """
     Check the startup time when using custom seccomp filters.
-
-    @type: performance
     """
-    microvm = test_microvm_with_api
+    for _ in range(10):
+        microvm = microvm_factory.build(guest_kernel_linux_5_10, rootfs)
+        _custom_filter_setup(microvm)
+        _test_startup_time(microvm, metrics, "custom_seccomp")
 
-    _custom_filter_setup(microvm)
-    record_property("startup_time_custom_seccomp_μs", _test_startup_time(microvm))
 
-
-def _test_startup_time(microvm):
+def _test_startup_time(microvm, metrics, test_suffix: str):
     microvm.spawn()
-
     microvm.basic_config(vcpu_count=2, mem_size_mib=1024)
-
-    # Configure metrics.
-    metrics_fifo_path = os.path.join(microvm.path, "metrics_fifo")
-    metrics_fifo = log_tools.Fifo(metrics_fifo_path)
-
-    response = microvm.metrics.put(
-        metrics_path=microvm.create_jailed_resource(metrics_fifo.path)
+    metrics.set_dimensions(
+        {**microvm.dimensions, "performance_test": f"test_startup_time_{test_suffix}"}
     )
-    assert microvm.api_session.is_status_no_content(response.status_code)
-
+    test_start_time = time.time()
     microvm.start()
     time.sleep(0.4)
 
-    # The metrics fifo should be at index 1.
+    # The metrics should be at index 1.
     # Since metrics are flushed at InstanceStart, the first line will suffice.
-    lines = metrics_fifo.sequential_reader(1)
-    metrics = json.loads(lines[0])
-    startup_time_us = metrics["api_server"]["process_startup_time_us"]
-    cpu_startup_time_us = metrics["api_server"]["process_startup_time_cpu_us"]
+    datapoints = microvm.get_all_metrics()
+    test_end_time = time.time()
+    fc_metrics = datapoints[0]
+    startup_time_us = fc_metrics["api_server"]["process_startup_time_us"]
+    cpu_startup_time_us = fc_metrics["api_server"]["process_startup_time_cpu_us"]
 
     print(
         "Process startup time is: {} us ({} CPU us)".format(
@@ -79,11 +67,15 @@ def _test_startup_time(microvm):
         )
     )
 
-    max_startup_time = MAX_STARTUP_TIME_CPU_US[platform.machine()]
     assert cpu_startup_time_us > 0
-    assert cpu_startup_time_us <= max_startup_time
+    # Check that startup time is not a huge value
+    # This is to catch issues like the ones introduced in PR
+    # https://github.com/firecracker-microvm/firecracker/pull/4305
+    test_time_delta_us = (test_end_time - test_start_time) * 1000 * 1000
+    assert startup_time_us < test_time_delta_us
+    assert cpu_startup_time_us < test_time_delta_us
 
-    return f"{cpu_startup_time_us} us", f"<= {max_startup_time} us"
+    metrics.put_metric("startup_time", cpu_startup_time_us, unit="Microseconds")
 
 
 def _custom_filter_setup(test_microvm):
